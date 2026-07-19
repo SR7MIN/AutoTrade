@@ -588,6 +588,35 @@ class OrderJournal:
             ).fetchone()
         return int(row["value"]) if row and row["value"] is not None else None
 
+    def candles(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT symbol, interval, open_time, close_time, open, high, low, close,
+                   volume, trade_count, closed
+            FROM candles
+            WHERE symbol = ? AND interval = ? AND closed = 1
+        """
+        params: list[Any] = [symbol.upper(), interval]
+        if start_time is not None:
+            query += " AND open_time >= ?"
+            params.append(start_time)
+        if end_time is not None:
+            query += " AND open_time < ?"
+            params.append(end_time)
+        query += " ORDER BY open_time"
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        values = [dict(row) for row in rows]
+        for value in values:
+            value["closed"] = bool(value["closed"])
+        return values
+
     def active_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM orders WHERE status NOT IN ('FILLED','CANCELED','EXPIRED','REJECTED')"
         params: tuple[Any, ...] = ()

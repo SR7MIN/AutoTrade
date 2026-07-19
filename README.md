@@ -1,6 +1,6 @@
 # AutoTrade 策略接入前核心系统
 
-这是一个 Testnet 优先的 Binance USDⓈ-M 永续合约执行与监督核心，不包含交易策略。系统提供策略接入前必须具备的账户控制、硬性风控、持久化状态、断线对账、行情数据契约和人工操作能力。
+这是一个 Testnet 优先的 Binance USDⓈ-M 永续合约执行与监督核心。系统提供策略接入前必须具备的账户控制、硬性风控、持久化状态、断线对账、行情数据契约和人工操作能力，并包含一个只用于离线工程验证的 EMA/ATR 策略。该策略不会接入 daemon 或发送订单。
 
 主网默认锁定，只有同时设置 `BINANCE_ENV=mainnet` 和 `BINANCE_ALLOW_MAINNET=I_UNDERSTAND` 才能解锁。
 
@@ -47,6 +47,20 @@ autotrade audit --limit 20
 ```powershell
 autotrade backfill --symbol BTCUSDT --interval 1m
 ```
+
+分页回补 UTC 历史范围到独立研究数据库：
+
+```powershell
+autotrade backfill-range --symbol BTCUSDT --interval 5m --start 2026-04-01 --end 2026-07-01 --database .autotrade/research.db
+```
+
+使用相同的已收盘 K 线契约离线回放工程验证策略：
+
+```powershell
+autotrade replay-strategy --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m --database .autotrade/research.db
+```
+
+执行模型和限制见 [工程验证策略](docs/strategy-validation.md)。
 
 ## 启动监督进程
 

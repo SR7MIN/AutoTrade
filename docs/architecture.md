@@ -3,17 +3,18 @@
 ## 模块边界
 
 ```text
-已收盘行情 -> 未来策略 -> 不可变 EntryIntent
-                              |
-                              v
+已收盘行情 -> 策略 -> 不可变 StrategySignal -> 未来执行适配器 -> EntryIntent
+                                                              |
+                                                              v
 人工命令队列 -> 硬性 RiskGovernor -> TradingService -> Binance REST
                     ^                    |
                     |                    v
              持久化控制状态 <- OrderJournal <- 用户数据流 / REST 对账
 ```
 
-未来策略只能读取 `Candle` 并产生 `EntryIntent`。策略不能获得
+策略只能读取 `Candle` 并产生 `StrategySignal`。策略不能获得
 `BinanceRestClient`、`Settings`、API Key、数据库连接或直接下单接口。
+历史回放和未来实时运行器负责将通过运行门禁的信号转换为 `EntryIntent`。
 
 ## 组件职责
 
@@ -23,7 +24,10 @@
 - `trading.py`：持仓生命周期、保护单替换、平仓和执行结果恢复。
 - `journal.py`：SQLite WAL 模式下的意图、订单、事件、成交、审计、控制、命令和 K 线。
 - `daemon.py`：独占写入、命令处理、用户数据流恢复和账户对账。
-- `market_data.py`：收盘 K 线契约、去重和 REST 断档补齐。
+- `candles.py`：不依赖交易或存储服务的纯收盘 K 线契约。
+- `market_data.py`：行情去重、范围回补和 REST 断档补齐。
+- `strategy/`：无交易依赖的指标、策略契约和 EMA/ATR 工程验证策略。
+- `backtest.py`：下一根 K 线成交、保守同柱处理和成本模拟的离线回放。
 - `observability.py`：结构化 JSON 日志、敏感字段脱敏和持久化告警。
 
 ## 恢复模型

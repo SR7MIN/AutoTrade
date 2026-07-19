@@ -4,10 +4,15 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
+from .backtest import BacktestEngine
 from .binance_rest import BinanceRestClient
+from .candles import Candle
 from .config import Settings
 from .daemon import AccountReconciler, TradingDaemon
 from .errors import AutoTradeError
@@ -19,6 +24,7 @@ from .market_data import MarketDataService
 from .observability import AlertManager, configure_logging
 from .risk_control import RiskGovernor, utc_day_start_ms
 from .rules import SymbolRules, decimal_value
+from .strategy import EmaAtrStrategy, build_strategy
 from .trading import TradingService
 from .user_stream import stream_user_events
 
@@ -28,6 +34,22 @@ def decimal_argument(value: str) -> Decimal:
         return Decimal(value)
     except InvalidOperation as exc:
         raise argparse.ArgumentTypeError(f"invalid decimal: {value}") from exc
+
+
+def timestamp_argument(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "timestamp must be epoch milliseconds or an ISO-8601 date/time"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 
 
 def print_json(payload: Any, *, stream: Any = sys.stdout) -> None:
@@ -148,6 +170,32 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--symbol", required=True)
     backfill.add_argument("--interval", default="1m")
 
+    backfill_range = subparsers.add_parser(
+        "backfill-range", help="page through a closed-kline UTC range into a research database"
+    )
+    backfill_range.add_argument("--symbol", required=True)
+    backfill_range.add_argument("--interval", default="5m")
+    backfill_range.add_argument("--start", required=True, type=timestamp_argument)
+    backfill_range.add_argument("--end", required=True, type=timestamp_argument)
+    backfill_range.add_argument("--page-limit", type=int, default=1000)
+    backfill_range.add_argument(
+        "--database", type=Path, default=Path(".autotrade/research.db")
+    )
+
+    replay = subparsers.add_parser(
+        "replay-strategy", help="replay a deterministic strategy over stored closed klines"
+    )
+    replay.add_argument("--strategy", choices=(EmaAtrStrategy.name,), default=EmaAtrStrategy.name)
+    replay.add_argument("--symbol", required=True)
+    replay.add_argument("--interval", default="5m")
+    replay.add_argument("--start", type=timestamp_argument)
+    replay.add_argument("--end", type=timestamp_argument)
+    replay.add_argument("--database", type=Path, default=Path(".autotrade/research.db"))
+    replay.add_argument("--initial-balance", type=decimal_argument, default=Decimal("1000"))
+    replay.add_argument("--fee-bps", type=decimal_argument, default=Decimal("5"))
+    replay.add_argument("--slippage-bps", type=decimal_argument, default=Decimal("10"))
+    replay.add_argument("--cooldown-bars", type=int, default=3)
+
     journal = subparsers.add_parser("journal", help="show recent local trade intents")
     journal.add_argument("--limit", type=int, default=20)
     return parser
@@ -155,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def credentials_required(args: argparse.Namespace) -> bool:
     if args.command in {
-        "account", "stream", "watch", "daemon", "snapshot", "income", "backfill",
+        "account", "stream", "watch", "daemon", "snapshot", "income",
         "take-profit", "close-position", "replace-stop", "replace-take-profit",
         "protect-position", "reconcile",
     }:
@@ -224,6 +272,32 @@ def run(args: argparse.Namespace) -> int:
 
     if args.command == "daemon":
         asyncio.run(TradingDaemon(settings, args.symbols, args.interval).run())
+        return 0
+
+    if args.command == "replay-strategy":
+        journal = OrderJournal(args.database)
+        try:
+            candles = [
+                Candle.from_dict(value)
+                for value in journal.candles(
+                    args.symbol,
+                    args.interval,
+                    start_time=args.start,
+                    end_time=args.end,
+                )
+            ]
+        finally:
+            journal.close()
+        strategy = build_strategy(
+            args.strategy, symbol=args.symbol, interval=args.interval
+        )
+        result = BacktestEngine(
+            initial_balance=args.initial_balance,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            cooldown_bars=args.cooldown_bars,
+        ).run(candles, strategy)
+        print_json({"database": str(args.database), **result.as_dict()})
         return 0
 
     with BinanceRestClient(settings) as client:
@@ -306,17 +380,49 @@ def run(args: argparse.Namespace) -> int:
             asyncio.run(stream_user_events(client, settings.ws_url, lambda event: print_json(event)))
             return 0
 
+        if args.command in {"backfill", "backfill-range"}:
+            target = settings.database_path if args.command == "backfill" else args.database
+            live_database = target.resolve() == settings.database_path.resolve()
+            if live_database and lock_owner_active(settings.lock_path):
+                raise InstanceLockError(
+                    "daemon is active; backfill the separate research database instead"
+                )
+            if live_database and settings.lock_path.exists():
+                raise InstanceLockError(
+                    f"Stale writer lock detected at {settings.lock_path}; verify before removal"
+                )
+            lock = SingleInstanceLock(settings.lock_path) if live_database else nullcontext()
+            with lock:
+                journal = OrderJournal(target)
+                try:
+                    client.sync_time()
+                    market = MarketDataService(client, journal, settings.ws_url)
+                    if args.command == "backfill":
+                        payload: dict[str, Any] = {
+                            "inserted": market.backfill(args.symbol, args.interval),
+                            "symbol": args.symbol.upper(),
+                            "database": str(target),
+                        }
+                    else:
+                        payload = {
+                            "database": str(target),
+                            **market.backfill_range(
+                                args.symbol,
+                                args.interval,
+                                start_time=args.start,
+                                end_time=args.end,
+                                page_limit=args.page_limit,
+                            ).as_dict(),
+                        }
+                    print_json(payload)
+                finally:
+                    journal.close()
+            return 0
+
         journal = OrderJournal(settings.database_path)
         try:
             risk = RiskGovernor(settings.risk, journal)
             service = TradingService(client, journal, risk)
-            if args.command == "backfill":
-                client.sync_time()
-                inserted = MarketDataService(
-                    client, journal, settings.ws_url
-                ).backfill(args.symbol, args.interval)
-                print_json({"inserted": inserted, "symbol": args.symbol.upper()})
-                return 0
             if args.command in {"preview", "bracket"} and not (
                 args.command == "bracket" and args.execute
             ):
