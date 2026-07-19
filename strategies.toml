@@ -1,0 +1,83 @@
+[instances.ema-default]
+implementation = "ema-atr-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "5m"
+
+[instances.ema-default.parameters]
+fast_period = 20
+slow_period = 50
+atr_period = 14
+stop_atr_multiple = "2"
+reward_risk = "2"
+risk_usdt = "1"
+leverage = 3
+margin_utilization = "0.50"
+
+[instances.ema-fast]
+implementation = "ema-atr-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "5m"
+
+[instances.ema-fast.parameters]
+fast_period = 10
+slow_period = 30
+atr_period = 14
+stop_atr_multiple = "2"
+reward_risk = "2"
+risk_usdt = "1"
+leverage = 3
+margin_utilization = "0.50"
+
+[instances.lifecycle-pulse]
+implementation = "lifecycle-pulse-testnet-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "5m"
+
+[instances.lifecycle-pulse.parameters]
+stop_bps = "10"
+take_profit_bps = "15"
+risk_usdt = "1"
+leverage = 3
+margin_utilization = "0.50"
+cooldown_bars = 1
+
+[instances.divergence-btc-5m]
+implementation = "multi-divergence-reversal-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "5m"
+
+[instances.divergence-btc-5m.parameters]
+pivot_period = 5
+pivot_source = "high_low"
+max_pivots = 16
+max_bars_to_check = 100
+divergence_types = ["regular", "hidden"]
+indicators = [
+  "rsi",
+  "macd",
+  "macd_histogram",
+  "stochastic",
+  "cci",
+  "momentum",
+  "obv",
+  "vwmacd",
+  "cmf",
+]
+min_entry_divergences = 2
+min_reverse_divergences = 2
+count_mode = "unique_indicators"
+conflict_policy = "hold"
+require_confirmation = true
+atr_period = 14
+stop_atr_buffer = "0.5"
+min_stop_atr = "0.5"
+max_stop_atr = "3"
+safety_take_profit_rr = "3"
+risk_usdt = "1"
+leverage = 3
+margin_utilization = "0.50"
+allow_pyramiding = false

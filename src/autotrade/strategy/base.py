@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from ..candles import Candle
 
@@ -25,6 +25,7 @@ class StrategySignal:
     margin_utilization: Decimal
     indicators: tuple[tuple[str, str], ...]
     reason: str
+    instance_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.side not in {"BUY", "SELL"}:
@@ -59,13 +60,14 @@ class StrategySignal:
             "marginUtilization": str(self.margin_utilization),
             "indicators": dict(self.indicators),
             "reason": self.reason,
+            "instanceId": self.instance_id,
         }
 
     @property
     def signal_id(self) -> str:
         identity = ":".join(
             (
-                self.strategy,
+                self.instance_id or self.strategy,
                 self.version,
                 self.symbol,
                 self.interval,
@@ -96,7 +98,183 @@ class StrategySignal:
             margin_utilization=Decimal(str(payload["marginUtilization"])),
             indicators=tuple((str(key), str(value)) for key, value in indicators.items()),
             reason=str(payload["reason"]),
+            instance_id=(
+                str(payload["instanceId"])
+                if payload.get("instanceId") is not None
+                else None
+            ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DivergenceEvidence:
+    indicator: str
+    divergence_type: str
+    direction: str
+    current_pivot_time: int
+    previous_pivot_time: int
+    current_price: Decimal
+    previous_price: Decimal
+    current_indicator: Decimal
+    previous_indicator: Decimal
+
+    def __post_init__(self) -> None:
+        if self.divergence_type not in {"REGULAR", "HIDDEN"}:
+            raise ValueError("divergence type must be REGULAR or HIDDEN")
+        if self.direction not in {"BULLISH", "BEARISH"}:
+            raise ValueError("divergence direction must be BULLISH or BEARISH")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "indicator": self.indicator,
+            "divergenceType": self.divergence_type,
+            "direction": self.direction,
+            "currentPivotTime": self.current_pivot_time,
+            "previousPivotTime": self.previous_pivot_time,
+            "currentPrice": str(self.current_price),
+            "previousPrice": str(self.previous_price),
+            "currentIndicator": str(self.current_indicator),
+            "previousIndicator": str(self.previous_indicator),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "DivergenceEvidence":
+        return cls(
+            indicator=str(value["indicator"]),
+            divergence_type=str(value["divergenceType"]),
+            direction=str(value["direction"]),
+            current_pivot_time=int(value["currentPivotTime"]),
+            previous_pivot_time=int(value["previousPivotTime"]),
+            current_price=Decimal(str(value["currentPrice"])),
+            previous_price=Decimal(str(value["previousPrice"])),
+            current_indicator=Decimal(str(value["currentIndicator"])),
+            previous_indicator=Decimal(str(value["previousIndicator"])),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyDecision:
+    strategy: str
+    version: str
+    instance_id: str
+    symbol: str
+    interval: str
+    candle_open_time: int
+    candle_close_time: int
+    action: str
+    current_position: str
+    target_position: str
+    bullish_count: int
+    bearish_count: int
+    evidence: tuple[DivergenceEvidence, ...]
+    entry_signal: StrategySignal
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.action not in {"ENTER", "REVERSE"}:
+            raise ValueError("strategy decision action must be ENTER or REVERSE")
+        if self.current_position not in {"FLAT", "LONG", "SHORT"}:
+            raise ValueError("invalid current strategy position")
+        if self.target_position not in {"LONG", "SHORT"}:
+            raise ValueError("strategy decision target must be LONG or SHORT")
+        expected_side = "BUY" if self.target_position == "LONG" else "SELL"
+        if self.entry_signal.side != expected_side:
+            raise ValueError("decision target does not match entry signal side")
+        if self.action == "ENTER" and self.current_position != "FLAT":
+            raise ValueError("ENTER decision requires a flat current position")
+        if self.action == "REVERSE" and self.current_position == "FLAT":
+            raise ValueError("REVERSE decision requires an open current position")
+        if self.action == "REVERSE" and self.current_position == self.target_position:
+            raise ValueError("REVERSE target must oppose current position")
+        bullish = len(
+            {item.indicator for item in self.evidence if item.direction == "BULLISH"}
+        )
+        bearish = len(
+            {item.indicator for item in self.evidence if item.direction == "BEARISH"}
+        )
+        if bullish != self.bullish_count or bearish != self.bearish_count:
+            raise ValueError("decision divergence counts do not match evidence")
+
+    @property
+    def decision_id(self) -> str:
+        evidence_identity = ",".join(
+            f"{item.indicator}:{item.divergence_type}:{item.direction}:"
+            f"{item.current_pivot_time}:{item.previous_pivot_time}"
+            for item in sorted(
+                self.evidence,
+                key=lambda item: (
+                    item.indicator,
+                    item.divergence_type,
+                    item.previous_pivot_time,
+                ),
+            )
+        )
+        identity = ":".join(
+            (
+                self.instance_id,
+                self.version,
+                self.symbol,
+                self.interval,
+                str(self.candle_close_time),
+                self.action,
+                self.current_position,
+                self.target_position,
+                evidence_identity,
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "strategy": self.strategy,
+            "version": self.version,
+            "instanceId": self.instance_id,
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "candleOpenTime": self.candle_open_time,
+            "candleCloseTime": self.candle_close_time,
+            "action": self.action,
+            "currentPosition": self.current_position,
+            "targetPosition": self.target_position,
+            "bullishCount": self.bullish_count,
+            "bearishCount": self.bearish_count,
+            "evidence": [item.as_dict() for item in self.evidence],
+            "entrySignal": self.entry_signal.as_dict(),
+            "reason": self.reason,
+            "decisionId": self.decision_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "StrategyDecision":
+        evidence = value.get("evidence") or []
+        if not isinstance(evidence, list):
+            raise ValueError("decision evidence must be an array")
+        signal = value.get("entrySignal")
+        if not isinstance(signal, dict):
+            raise ValueError("decision entry signal must be an object")
+        result = cls(
+            strategy=str(value["strategy"]),
+            version=str(value["version"]),
+            instance_id=str(value["instanceId"]),
+            symbol=str(value["symbol"]).upper(),
+            interval=str(value["interval"]),
+            candle_open_time=int(value["candleOpenTime"]),
+            candle_close_time=int(value["candleCloseTime"]),
+            action=str(value["action"]),
+            current_position=str(value["currentPosition"]),
+            target_position=str(value["targetPosition"]),
+            bullish_count=int(value["bullishCount"]),
+            bearish_count=int(value["bearishCount"]),
+            evidence=tuple(DivergenceEvidence.from_dict(item) for item in evidence),
+            entry_signal=StrategySignal.from_dict(signal),
+            reason=str(value["reason"]),
+        )
+        if value.get("decisionId") not in {None, result.decision_id}:
+            raise ValueError("strategy decision ID does not match content")
+        return result
+
+
+StrategyOutput: TypeAlias = StrategySignal | StrategyDecision
 
 
 class Strategy(Protocol):
@@ -104,7 +282,8 @@ class Strategy(Protocol):
     version: str
     symbol: str
     interval: str
+    instance_id: str
 
     def reset(self) -> None: ...
 
-    def on_candle(self, candle: Candle) -> StrategySignal | None: ...
+    def on_candle(self, candle: Candle) -> StrategyOutput | None: ...

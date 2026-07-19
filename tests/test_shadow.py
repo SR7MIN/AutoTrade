@@ -7,7 +7,12 @@ from pathlib import Path
 from autotrade.journal import OrderJournal
 from autotrade.market_data import Candle
 from autotrade.shadow import ShadowRunner
-from autotrade.strategy.base import StrategySignal
+from autotrade.strategy.base import (
+    DivergenceEvidence,
+    StrategyDecision,
+    StrategySignal,
+)
+from autotrade.strategy.lifecycle_pulse import LifecyclePulseStrategy
 
 
 def candle(index, *, high="105", low="95", close="100"):
@@ -31,6 +36,7 @@ class FixedStrategy:
     version = "1"
     symbol = "BTCUSDT"
     interval = "5m"
+    instance_id = "fixed-test"
 
     def __init__(self, indexes):
         self.indexes = set(indexes)
@@ -58,7 +64,90 @@ class FixedStrategy:
             margin_utilization=Decimal("0.5"),
             indicators=(),
             reason="fixture",
+            instance_id=self.instance_id,
         )
+
+
+class FixedDecisionStrategy:
+    name = "decision-fixed"
+    version = "1"
+    symbol = "BTCUSDT"
+    interval = "5m"
+    instance_id = "decision-fixed"
+
+    def __init__(self):
+        self.position = "FLAT"
+
+    def reset(self):
+        self.position = "FLAT"
+
+    def set_position(self, position):
+        self.position = position
+
+    def _decision(self, value, *, side, action, current, target):
+        direction = "BULLISH" if side == "BUY" else "BEARISH"
+        signal = StrategySignal(
+            strategy=self.name,
+            version=self.version,
+            symbol=value.symbol,
+            interval=value.interval,
+            candle_open_time=value.open_time,
+            candle_close_time=value.close_time,
+            side=side,
+            reference_price=Decimal("100"),
+            stop_price=Decimal("90" if side == "BUY" else "110"),
+            take_profit_price=Decimal("120" if side == "BUY" else "80"),
+            risk_usdt=Decimal("1"),
+            leverage=3,
+            margin_utilization=Decimal("0.5"),
+            indicators=(),
+            reason="fixture",
+            instance_id=self.instance_id,
+        )
+        item = DivergenceEvidence(
+            indicator="rsi",
+            divergence_type="REGULAR",
+            direction=direction,
+            current_pivot_time=value.open_time,
+            previous_pivot_time=max(0, value.open_time - 300_000),
+            current_price=Decimal("90" if side == "BUY" else "110"),
+            previous_price=Decimal("95" if side == "BUY" else "105"),
+            current_indicator=Decimal("60" if side == "BUY" else "40"),
+            previous_indicator=Decimal("50"),
+        )
+        return StrategyDecision(
+            strategy=self.name,
+            version=self.version,
+            instance_id=self.instance_id,
+            symbol=value.symbol,
+            interval=value.interval,
+            candle_open_time=value.open_time,
+            candle_close_time=value.close_time,
+            action=action,
+            current_position=current,
+            target_position=target,
+            bullish_count=1 if side == "BUY" else 0,
+            bearish_count=1 if side == "SELL" else 0,
+            evidence=(item,),
+            entry_signal=signal,
+            reason="fixture",
+        )
+
+    def on_candle(self, value):
+        index = value.open_time // 300_000
+        if index == 1 and self.position == "FLAT":
+            return self._decision(
+                value, side="BUY", action="ENTER", current="FLAT", target="LONG"
+            )
+        if index == 2 and self.position == "LONG":
+            return self._decision(
+                value,
+                side="SELL",
+                action="REVERSE",
+                current="LONG",
+                target="SHORT",
+            )
+        return None
 
 
 class ShadowRunnerTests(unittest.TestCase):
@@ -133,6 +222,7 @@ class ShadowRunnerTests(unittest.TestCase):
                 {
                     "strategy": "other",
                     "version": "1",
+                    "instance_id": "fixed-test",
                     "symbol": "BTCUSDT",
                     "interval": "5m",
                     "last_open_time": 0,
@@ -159,6 +249,43 @@ class ShadowRunnerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "does not match"):
             ShadowRunner.load_signal(self.log)
+
+    def test_lifecycle_strategy_emits_first_new_bar_into_its_own_paths(self):
+        root = Path(self.directory.name) / "strategies" / "lifecycle-pulse"
+        runner = ShadowRunner(
+            database_path=self.database,
+            state_path=root / "state.json",
+            log_path=root / "shadow.jsonl",
+            cooldown_bars=1,
+        )
+        strategy = LifecyclePulseStrategy(
+            symbol="BTCUSDT", interval="5m", instance_id="lifecycle-pulse"
+        )
+        self.store(candle(0))
+        warmup = runner.run_once(strategy)
+        self.assertEqual(warmup.signals_emitted, 0)
+        self.store(candle(1, close="101"))
+        result = runner.run_once(strategy)
+        self.assertEqual(result.signals_emitted, 1)
+        self.assertEqual(result.signals_accepted, 1)
+        loaded = ShadowRunner.load_signal(root / "shadow.jsonl")
+        self.assertEqual(loaded.instance_id, "lifecycle-pulse")
+        self.assertEqual(loaded.candle_open_time, candle(1).open_time)
+
+    def test_shadow_logs_and_replays_two_phase_reversal_decision(self):
+        self.store(candle(0))
+        self.runner.run_once(FixedDecisionStrategy())
+        self.store(candle(1))
+        entered = self.runner.run_once(FixedDecisionStrategy())
+        self.assertEqual(entered.signals_accepted, 1)
+        self.store(candle(2))
+        reversed_result = self.runner.run_once(FixedDecisionStrategy())
+        self.assertEqual(reversed_result.signals_accepted, 1)
+        lines = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(lines[-1]["decision"], "REVERSE_ACCEPTED")
+        loaded = ShadowRunner.load_decision(self.log, lines[-1]["decisionId"])
+        self.assertEqual(loaded.action, "REVERSE")
+        self.assertEqual(loaded.target_position, "SHORT")
 
 
 if __name__ == "__main__":

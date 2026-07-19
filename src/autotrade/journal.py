@@ -179,6 +179,18 @@ class OrderJournal:
             created_at TEXT NOT NULL,
             FOREIGN KEY(command_id) REFERENCES operator_commands(id)
         );
+        CREATE TABLE IF NOT EXISTS strategy_reversals (
+            decision_id TEXT PRIMARY KEY,
+            command_id INTEGER NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            from_position TEXT NOT NULL,
+            target_position TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(command_id) REFERENCES operator_commands(id)
+        );
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
@@ -772,7 +784,7 @@ class OrderJournal:
             row = self._connection.execute(
                 """
                 SELECT 1 FROM operator_commands
-                WHERE command_type = 'ENTRY_INTENT'
+                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE')
                   AND status IN ('PENDING', 'RUNNING')
                 LIMIT 1
                 """
@@ -782,28 +794,41 @@ class OrderJournal:
     def enqueue_strategy_signal(
         self, signal_id: str, payload: dict[str, Any]
     ) -> int | None:
+        return self.enqueue_strategy_command(
+            signal_id, "ENTRY_INTENT", payload
+        )
+
+    def enqueue_strategy_command(
+        self,
+        submission_id: str,
+        command_type: str,
+        payload: dict[str, Any],
+    ) -> int | None:
+        if command_type not in {"ENTRY_INTENT", "STRATEGY_REVERSE"}:
+            raise ValueError("unsupported strategy command type")
         now = utc_now()
         with self._lock, self._connection:
             if self._connection.execute(
                 """
                 SELECT 1 FROM operator_commands
-                WHERE command_type = 'ENTRY_INTENT'
+                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE')
                   AND status IN ('PENDING', 'RUNNING')
                 LIMIT 1
                 """
             ).fetchone():
                 return None
             if self._connection.execute(
-                "SELECT 1 FROM strategy_submissions WHERE signal_id = ?", (signal_id,)
+                "SELECT 1 FROM strategy_submissions WHERE signal_id = ?",
+                (submission_id,),
             ).fetchone():
                 return None
             cursor = self._connection.execute(
                 """
                 INSERT INTO operator_commands (
                     command_type, payload_json, status, created_at, updated_at
-                ) VALUES ('ENTRY_INTENT', ?, 'PENDING', ?, ?)
+                ) VALUES (?, ?, 'PENDING', ?, ?)
                 """,
-                (_json(payload), now, now),
+                (command_type, _json(payload), now, now),
             )
             command_id = int(cursor.lastrowid)
             self._connection.execute(
@@ -811,17 +836,110 @@ class OrderJournal:
                 INSERT INTO strategy_submissions(signal_id, command_id, created_at)
                 VALUES (?, ?, ?)
                 """,
-                (signal_id, command_id, now),
+                (submission_id, command_id, now),
             )
+            if command_type == "STRATEGY_REVERSE":
+                decision = payload.get("decision") or {}
+                self._connection.execute(
+                    """
+                    INSERT INTO strategy_reversals(
+                        decision_id, command_id, symbol, from_position,
+                        target_position, phase, details_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'QUEUED', '{}', ?, ?)
+                    """,
+                    (
+                        submission_id,
+                        command_id,
+                        str(payload.get("symbol") or "").upper(),
+                        str(decision.get("currentPosition") or ""),
+                        str(decision.get("targetPosition") or ""),
+                        now,
+                        now,
+                    ),
+                )
             self._append_audit_locked(
                 "operator_command",
                 "QUEUED",
                 payload.get("symbol"),
                 str(command_id),
                 "WARNING",
-                {"command_type": "ENTRY_INTENT", "signal_id": signal_id, **payload},
+                {
+                    "command_type": command_type,
+                    "submission_id": submission_id,
+                    **payload,
+                },
             )
         return command_id
+
+    def set_strategy_reversal_phase(
+        self, decision_id: str, phase: str, details: dict[str, Any] | None = None
+    ) -> None:
+        allowed = {
+            "QUEUED",
+            "CLOSING",
+            "CLOSE_CONFIRMED",
+            "ENTERING",
+            "ENTRY_CONFIRMED",
+            "FAILED",
+        }
+        if phase not in allowed:
+            raise ValueError("invalid strategy reversal phase")
+        now = utc_now()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE strategy_reversals
+                SET phase=?, details_json=?, updated_at=?
+                WHERE decision_id=?
+                """,
+                (phase, _json(details or {}), now, decision_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"unknown strategy reversal: {decision_id}")
+            self._append_audit_locked(
+                "strategy_reversal",
+                phase,
+                None,
+                decision_id,
+                "ERROR" if phase == "FAILED" else "INFO",
+                details or {},
+            )
+
+    def strategy_reversal(self, decision_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM strategy_reversals WHERE decision_id=?",
+                (decision_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def recover_interrupted_strategy_reversals(self) -> int:
+        now = utc_now()
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id FROM operator_commands
+                WHERE command_type='STRATEGY_REVERSE' AND status='RUNNING'
+                """
+            ).fetchall()
+            if rows:
+                self._connection.execute(
+                    """
+                    UPDATE operator_commands SET status='PENDING', updated_at=?
+                    WHERE command_type='STRATEGY_REVERSE' AND status='RUNNING'
+                    """,
+                    (now,),
+                )
+                for row in rows:
+                    self._append_audit_locked(
+                        "strategy_reversal",
+                        "RECOVERY_QUEUED",
+                        None,
+                        str(row["id"]),
+                        "WARNING",
+                        {"reason": "daemon restarted during two-phase reversal"},
+                    )
+        return len(rows)
 
     def mark_command_running(self, command_id: int) -> bool:
         with self._lock, self._connection:

@@ -1,13 +1,52 @@
 from __future__ import annotations
 
-from .base import Strategy, StrategySignal
+from .base import (
+    DivergenceEvidence,
+    Strategy,
+    StrategyDecision,
+    StrategyOutput,
+    StrategySignal,
+)
 from .ema_atr import EmaAtrStrategy
+from .lifecycle_pulse import LifecyclePulseStrategy
+from .multi_divergence import MultiDivergenceReversalStrategy
+from .registry import (
+    BUILTIN_STRATEGIES,
+    StrategyRegistration,
+    StrategyRegistry,
+    load_installed_strategies,
+)
 
 
-def build_strategy(name: str, *, symbol: str, interval: str) -> Strategy:
-    if name == EmaAtrStrategy.name:
-        return EmaAtrStrategy(symbol=symbol, interval=interval)
-    raise ValueError(f"unknown strategy: {name}")
+def build_strategy(
+    name: str,
+    *,
+    symbol: str,
+    interval: str,
+    instance_id: str | None = None,
+    parameters: dict[str, object] | None = None,
+) -> Strategy:
+    return BUILTIN_STRATEGIES.create(
+        name,
+        instance_id=instance_id or name,
+        symbol=symbol,
+        interval=interval,
+        parameters=parameters,
+    )
 
 
-__all__ = ["EmaAtrStrategy", "Strategy", "StrategySignal", "build_strategy"]
+__all__ = [
+    "BUILTIN_STRATEGIES",
+    "EmaAtrStrategy",
+    "DivergenceEvidence",
+    "LifecyclePulseStrategy",
+    "MultiDivergenceReversalStrategy",
+    "Strategy",
+    "StrategyDecision",
+    "StrategyOutput",
+    "StrategyRegistration",
+    "StrategyRegistry",
+    "StrategySignal",
+    "build_strategy",
+    "load_installed_strategies",
+]

@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Sequence
 
 from .candles import Candle
-from .strategy import Strategy, StrategySignal
+from .strategy import Strategy, StrategyDecision, StrategySignal
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +60,7 @@ class BacktestTrade:
 class BacktestResult:
     strategy: str
     version: str
+    strategy_instance: str
     symbol: str
     interval: str
     candle_count: int
@@ -76,6 +77,7 @@ class BacktestResult:
         return {
             "strategy": self.strategy,
             "version": self.version,
+            "strategyInstance": self.strategy_instance,
             "symbol": self.symbol,
             "interval": self.interval,
             "candleCount": self.candle_count,
@@ -100,6 +102,13 @@ class _OpenPosition:
     entry_time: int
     entry_price: Decimal
     quantity: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingAction:
+    action: str
+    signal: StrategySignal
+    current_position: str
 
 
 class BacktestEngine:
@@ -130,14 +139,20 @@ class BacktestEngine:
         peak_balance = balance
         max_drawdown = Decimal(0)
         signal_count = 0
-        pending: StrategySignal | None = None
+        pending: _PendingAction | None = None
         position: _OpenPosition | None = None
         trades: list[BacktestTrade] = []
         rejections: list[BacktestRejection] = []
         cooldown_signal_until_index = -1
 
         def close_position(
-            candle_index: int, candle: Candle, raw_exit: Decimal, reason: str
+            candle_index: int,
+            candle: Candle,
+            raw_exit: Decimal,
+            reason: str,
+            *,
+            exit_time: int | None = None,
+            apply_cooldown: bool = True,
         ) -> None:
             nonlocal balance, peak_balance, max_drawdown, position
             nonlocal cooldown_signal_until_index
@@ -157,7 +172,7 @@ class BacktestEngine:
                     side=position.signal.side,
                     signal_time=position.signal.candle_close_time,
                     entry_time=position.entry_time,
-                    exit_time=candle.close_time,
+                    exit_time=candle.close_time if exit_time is None else exit_time,
                     entry_price=position.entry_price,
                     exit_price=exit_price,
                     stop_price=position.signal.stop_price,
@@ -173,51 +188,77 @@ class BacktestEngine:
             if peak_balance > 0:
                 max_drawdown = max(max_drawdown, (peak_balance - balance) / peak_balance)
             position = None
-            cooldown_signal_until_index = candle_index + self.cooldown_bars - 1
+            if apply_cooldown:
+                cooldown_signal_until_index = candle_index + self.cooldown_bars - 1
+
+        def open_position(candle: Candle, signal: StrategySignal) -> None:
+            nonlocal position
+            entry_price = self._entry_price(Decimal(candle.open), signal.side)
+            valid_gap = (
+                signal.stop_price < entry_price < signal.take_profit_price
+                if signal.side == "BUY"
+                else signal.take_profit_price < entry_price < signal.stop_price
+            )
+            if not valid_gap:
+                rejections.append(
+                    BacktestRejection(candle.open_time, "INVALID_ENTRY_GAP", signal)
+                )
+                return
+            expected_stop_exit = self._exit_price(signal.stop_price, signal.side)
+            stop_loss_per_unit = abs(entry_price - expected_stop_exit)
+            stop_fees_per_unit = (entry_price + expected_stop_exit) * self.fee_rate
+            risk_quantity = signal.risk_usdt / (
+                stop_loss_per_unit + stop_fees_per_unit
+            )
+            margin_quantity = (
+                balance
+                * signal.margin_utilization
+                * Decimal(signal.leverage)
+                / entry_price
+            )
+            quantity = min(risk_quantity, margin_quantity)
+            if quantity <= 0:
+                rejections.append(
+                    BacktestRejection(candle.open_time, "INSUFFICIENT_BALANCE", signal)
+                )
+                return
+            position = _OpenPosition(
+                signal=signal,
+                entry_time=candle.open_time,
+                entry_price=entry_price,
+                quantity=quantity,
+            )
 
         for candle_index, candle in enumerate(values):
             if pending is not None:
-                entry_price = self._entry_price(Decimal(candle.open), pending.side)
-                valid_gap = (
-                    pending.stop_price < entry_price < pending.take_profit_price
-                    if pending.side == "BUY"
-                    else pending.take_profit_price < entry_price < pending.stop_price
-                )
-                if not valid_gap:
-                    rejections.append(
-                        BacktestRejection(candle.open_time, "INVALID_ENTRY_GAP", pending)
-                    )
-                elif position is not None:
-                    rejections.append(
-                        BacktestRejection(candle.open_time, "POSITION_OPEN", pending)
-                    )
-                else:
-                    expected_stop_exit = self._exit_price(pending.stop_price, pending.side)
-                    stop_loss_per_unit = abs(entry_price - expected_stop_exit)
-                    stop_fees_per_unit = (
-                        entry_price + expected_stop_exit
-                    ) * self.fee_rate
-                    risk_quantity = pending.risk_usdt / (
-                        stop_loss_per_unit + stop_fees_per_unit
-                    )
-                    margin_quantity = (
-                        balance
-                        * pending.margin_utilization
-                        * Decimal(pending.leverage)
-                        / entry_price
-                    )
-                    quantity = min(risk_quantity, margin_quantity)
-                    if quantity <= 0:
+                if pending.action == "REVERSE":
+                    expected_side = "BUY" if pending.current_position == "LONG" else "SELL"
+                    if position is None or position.signal.side != expected_side:
                         rejections.append(
-                            BacktestRejection(candle.open_time, "INSUFFICIENT_BALANCE", pending)
+                            BacktestRejection(
+                                candle.open_time,
+                                "REVERSAL_POSITION_MISMATCH",
+                                pending.signal,
+                            )
                         )
                     else:
-                        position = _OpenPosition(
-                            signal=pending,
-                            entry_time=candle.open_time,
-                            entry_price=entry_price,
-                            quantity=quantity,
+                        close_position(
+                            candle_index,
+                            candle,
+                            Decimal(candle.open),
+                            "REVERSE",
+                            exit_time=candle.open_time,
+                            apply_cooldown=False,
                         )
+                        open_position(candle, pending.signal)
+                elif position is not None:
+                    rejections.append(
+                        BacktestRejection(
+                            candle.open_time, "POSITION_OPEN", pending.signal
+                        )
+                    )
+                else:
+                    open_position(candle, pending.signal)
                 pending = None
 
             if position is not None:
@@ -237,10 +278,19 @@ class BacktestEngine:
                         candle_index, candle, signal.take_profit_price, "TAKE_PROFIT"
                     )
 
-            signal = strategy.on_candle(candle)
-            if signal is None:
+            if hasattr(strategy, "set_position"):
+                current = (
+                    "FLAT"
+                    if position is None
+                    else "LONG" if position.signal.side == "BUY" else "SHORT"
+                )
+                strategy.set_position(current)  # type: ignore[attr-defined]
+            output = strategy.on_candle(candle)
+            if output is None:
                 continue
             signal_count += 1
+            decision = output if isinstance(output, StrategyDecision) else None
+            signal = decision.entry_signal if decision is not None else output
             if (
                 signal.symbol != candle.symbol
                 or signal.interval != candle.interval
@@ -250,22 +300,38 @@ class BacktestEngine:
                 rejections.append(
                     BacktestRejection(candle.open_time, "INVALID_SIGNAL_CONTEXT", signal)
                 )
+            elif pending is not None:
+                rejections.append(
+                    BacktestRejection(candle.open_time, "PENDING_ENTRY", signal)
+                )
+            elif decision is not None and decision.action == "REVERSE":
+                actual_position = (
+                    "FLAT"
+                    if position is None
+                    else "LONG" if position.signal.side == "BUY" else "SHORT"
+                )
+                if actual_position != decision.current_position:
+                    rejections.append(
+                        BacktestRejection(
+                            candle.open_time, "REVERSAL_POSITION_MISMATCH", signal
+                        )
+                    )
+                else:
+                    pending = _PendingAction(
+                        "REVERSE", signal, decision.current_position
+                    )
             elif position is not None:
                 rejections.append(
                     BacktestRejection(candle.open_time, "POSITION_OPEN", signal)
                 )
             elif candle_index <= cooldown_signal_until_index:
                 rejections.append(BacktestRejection(candle.open_time, "COOLDOWN", signal))
-            elif pending is not None:
-                rejections.append(
-                    BacktestRejection(candle.open_time, "PENDING_ENTRY", signal)
-                )
             else:
-                pending = signal
+                pending = _PendingAction("ENTER", signal, "FLAT")
 
         if pending is not None:
             rejections.append(
-                BacktestRejection(values[-1].open_time, "NO_NEXT_CANDLE", pending)
+                BacktestRejection(values[-1].open_time, "NO_NEXT_CANDLE", pending.signal)
             )
         if position is not None:
             close_position(
@@ -278,6 +344,7 @@ class BacktestEngine:
         return BacktestResult(
             strategy=strategy.name,
             version=strategy.version,
+            strategy_instance=getattr(strategy, "instance_id", strategy.name),
             symbol=values[0].symbol,
             interval=values[0].interval,
             candle_count=len(values),

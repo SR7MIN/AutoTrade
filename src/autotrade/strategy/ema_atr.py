@@ -16,6 +16,7 @@ class EmaAtrStrategy:
         *,
         symbol: str,
         interval: str,
+        instance_id: str | None = None,
         fast_period: int = 20,
         slow_period: int = 50,
         atr_period: int = 14,
@@ -35,6 +36,7 @@ class EmaAtrStrategy:
             raise ValueError("margin utilization must be in (0, 1]")
         self.symbol = symbol.upper()
         self.interval = interval
+        self.instance_id = instance_id or self.name
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.atr_period = atr_period
@@ -122,4 +124,5 @@ class EmaAtrStrategy:
                 ("atr", str(current_atr)),
             ),
             reason=reason,
+            instance_id=self.instance_id,
         )

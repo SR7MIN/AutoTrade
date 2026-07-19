@@ -101,6 +101,8 @@ class Settings:
     lock_path: Path
     risk: RiskSettings
     unprotected_action: str
+    strategy_config_path: Path
+    strategy_state_dir: Path
 
     @property
     def is_testnet(self) -> bool:
@@ -152,4 +154,10 @@ class Settings:
             lock_path=Path(os.getenv("AUTOTRADE_LOCK", ".autotrade/writer.lock")),
             risk=RiskSettings.from_env(),
             unprotected_action=unprotected_action,
+            strategy_config_path=Path(
+                os.getenv("AUTOTRADE_STRATEGY_CONFIG", "strategies.toml")
+            ),
+            strategy_state_dir=Path(
+                os.getenv("AUTOTRADE_STRATEGY_STATE_DIR", ".autotrade/strategies")
+            ),
         )

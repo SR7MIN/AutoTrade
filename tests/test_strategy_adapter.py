@@ -9,8 +9,13 @@ from unittest.mock import patch
 from autotrade.config import RiskSettings
 from autotrade.errors import ConfigurationError, EntryPaused, RuleViolation
 from autotrade.journal import OrderJournal
-from autotrade.strategy.base import StrategySignal
+from autotrade.strategy.base import (
+    DivergenceEvidence,
+    StrategyDecision,
+    StrategySignal,
+)
 from autotrade.strategy_adapter import TestnetStrategyAdapter
+from autotrade.strategy_manager import StrategyInstanceConfig
 
 
 def risk_settings():
@@ -49,6 +54,7 @@ def signal(close_time=1_000_000):
         margin_utilization=Decimal("0.5"),
         indicators=(),
         reason="fixture",
+        instance_id="ema-default",
     )
 
 
@@ -62,7 +68,17 @@ class StrategyAdapterTests(unittest.TestCase):
             risk=risk_settings(),
             lock_path=root / "writer.lock",
         )
-        self.adapter = TestnetStrategyAdapter(self.settings, self.journal)
+        self.instance = StrategyInstanceConfig(
+            instance_id="ema-default",
+            implementation="ema-atr-v1",
+            enabled=True,
+            symbol="BTCUSDT",
+            interval="5m",
+            parameters={},
+        )
+        self.adapter = TestnetStrategyAdapter(
+            self.settings, self.journal, self.instance, "1"
+        )
 
     def tearDown(self):
         self.journal.close()
@@ -72,8 +88,10 @@ class StrategyAdapterTests(unittest.TestCase):
         self.journal.set_control("entry_enabled", "true", "test")
         self.journal.set_control("user_stream_healthy", "true", "test")
         self.journal.set_control("market_data_BTCUSDT_5m_healthy", "true", "test")
+        self.journal.set_control("active_strategy_instance", "ema-default", "test")
 
     def test_preview_requires_health_but_does_not_enqueue(self):
+        self.journal.set_control("active_strategy_instance", "ema-default", "test")
         with self.assertRaises(EntryPaused):
             self.adapter.submit(signal(), execute=False, now_ms=1_001_000)
         self.healthy()
@@ -87,7 +105,7 @@ class StrategyAdapterTests(unittest.TestCase):
             is_testnet=False, risk=risk_settings(), lock_path=self.settings.lock_path
         )
         with self.assertRaises(ConfigurationError):
-            TestnetStrategyAdapter(mainnet, self.journal).submit(
+            TestnetStrategyAdapter(mainnet, self.journal, self.instance, "1").submit(
                 signal(), execute=False, now_ms=1_001_000
             )
         with self.assertRaisesRegex(RuleViolation, "1 USDT"):
@@ -100,6 +118,20 @@ class StrategyAdapterTests(unittest.TestCase):
             self.adapter.submit(
                 replace(signal(), leverage=4), execute=False, now_ms=1_001_000
             )
+
+    def test_testnet_only_registration_is_explicitly_rejected_on_mainnet(self):
+        self.healthy()
+        mainnet = SimpleNamespace(
+            is_testnet=False, risk=risk_settings(), lock_path=self.settings.lock_path
+        )
+        with self.assertRaisesRegex(ConfigurationError, "restricted to Testnet"):
+            TestnetStrategyAdapter(
+                mainnet,
+                self.journal,
+                self.instance,
+                "1",
+                testnet_only=True,
+            ).submit(signal(), execute=False, now_ms=1_001_000)
 
     def test_execute_requires_daemon_and_rejects_duplicate_signal(self):
         self.healthy()
@@ -119,6 +151,108 @@ class StrategyAdapterTests(unittest.TestCase):
         self.healthy()
         with self.assertRaisesRegex(RuleViolation, "stale"):
             self.adapter.submit(signal(), execute=False, now_ms=1_100_001)
+
+    def test_inactive_strategy_instance_is_rejected(self):
+        self.healthy()
+        fast_instance = replace(self.instance, instance_id="ema-fast")
+        adapter = TestnetStrategyAdapter(
+            self.settings, self.journal, fast_instance, "1"
+        )
+        with self.assertRaisesRegex(RuleViolation, "not active"):
+            adapter.submit(
+                replace(signal(), instance_id="ema-fast"),
+                execute=False,
+                now_ms=1_001_000,
+            )
+
+    def test_reversal_decision_queues_two_phase_strategy_command(self):
+        instance = replace(
+            self.instance,
+            instance_id="divergence-test",
+            implementation="multi-divergence-reversal-v1",
+        )
+        self.journal.set_control("entry_enabled", "true", "test")
+        self.journal.set_control("user_stream_healthy", "true", "test")
+        self.journal.set_control("market_data_BTCUSDT_5m_healthy", "true", "test")
+        self.journal.set_control("active_strategy_instance", "divergence-test", "test")
+        intent_id = self.journal.create_intent(
+            client_order_id="active-entry",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity="0.01",
+            stop_price="90",
+            take_profit_price="120",
+            details={},
+        )
+        self.journal.update(intent_id, "PROTECTED")
+        self.journal.record_order(
+            {
+                "symbol": "BTCUSDT",
+                "clientAlgoId": "active-stop",
+                "algoId": "1",
+                "side": "SELL",
+                "orderType": "STOP_MARKET",
+                "algoStatus": "NEW",
+                "quantity": "0.01",
+                "reduceOnly": True,
+            },
+            family="ALGO",
+            role="STOP",
+            intent_id=intent_id,
+        )
+        value = replace(
+            signal(),
+            strategy="multi-divergence-reversal-v1",
+            side="SELL",
+            stop_price=Decimal("110"),
+            take_profit_price=Decimal("80"),
+            instance_id="divergence-test",
+        )
+        evidence = DivergenceEvidence(
+            indicator="rsi",
+            divergence_type="REGULAR",
+            direction="BEARISH",
+            current_pivot_time=900_000,
+            previous_pivot_time=600_000,
+            current_price=Decimal("105"),
+            previous_price=Decimal("104"),
+            current_indicator=Decimal("60"),
+            previous_indicator=Decimal("70"),
+        )
+        decision = StrategyDecision(
+            strategy=value.strategy,
+            version=value.version,
+            instance_id="divergence-test",
+            symbol=value.symbol,
+            interval=value.interval,
+            candle_open_time=value.candle_open_time,
+            candle_close_time=value.candle_close_time,
+            action="REVERSE",
+            current_position="LONG",
+            target_position="SHORT",
+            bullish_count=0,
+            bearish_count=1,
+            evidence=(evidence,),
+            entry_signal=value,
+            reason="fixture",
+        )
+        adapter = TestnetStrategyAdapter(
+            self.settings, self.journal, instance, "1"
+        )
+        preview = adapter.submit_decision(
+            decision, execute=False, now_ms=1_001_000
+        )
+        self.assertEqual(preview.action, "REVERSE")
+        with patch("autotrade.strategy_adapter.lock_owner_active", return_value=True):
+            queued = adapter.submit_decision(
+                decision, execute=True, now_ms=1_001_000
+            )
+        command = self.journal.pending_commands()[0]
+        self.assertEqual(command["command_type"], "STRATEGY_REVERSE")
+        self.assertEqual(queued.decision_id, decision.decision_id)
+        self.assertEqual(
+            self.journal.strategy_reversal(decision.decision_id)["phase"], "QUEUED"
+        )
 
 
 if __name__ == "__main__":

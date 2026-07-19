@@ -1,6 +1,6 @@
 # AutoTrade 策略接入前核心系统
 
-这是一个 Testnet 优先的 Binance USDⓈ-M 永续合约执行与监督核心。系统提供策略接入前必须具备的账户控制、硬性风控、持久化状态、断线对账、行情数据契约和人工操作能力，并包含一个只用于离线工程验证的 EMA/ATR 策略。该策略不会接入 daemon 或发送订单。
+这是一个 Testnet 优先的 Binance USDⓈ-M 永续合约执行与监督核心。系统提供策略接入前必须具备的账户控制、硬性风控、持久化状态、断线对账、行情数据契约和人工操作能力，并包含 EMA/ATR 工程验证策略和一个高频触发的 Testnet 生命周期验证夹具。策略不会自行发送订单；只有人工显式确认的信号才可能进入 daemon 队列。
 
 主网默认锁定，只有同时设置 `BINANCE_ENV=mainnet` 和 `BINANCE_ALLOW_MAINNET=I_UNDERSTAND` 才能解锁。
 
@@ -62,15 +62,34 @@ autotrade replay-strategy --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m -
 
 执行模型和限制见 [工程验证策略](docs/strategy-validation.md)。
 
-只读 Shadow 运行和显式 Testnet 信号提交：
+查看策略实例、只读 Shadow 和显式 Testnet 信号提交：
 
 ```powershell
-autotrade shadow --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m --database .autotrade/orders.db
-autotrade submit-strategy --log .autotrade/shadow.jsonl
+autotrade strategies
+autotrade shadow --instance lifecycle-pulse --database .autotrade/orders.db
+autotrade activate-strategy --instance lifecycle-pulse --reason "验证 Testnet 订单生命周期"
+autotrade submit-strategy --instance lifecycle-pulse
 ```
 
 Shadow 不会自动下单。提交命令默认仍是预览，实际入队必须同时使用 `--execute` 和
 `--confirm-testnet I_UNDERSTAND`，并通过全部健康、风险和重复信号门禁。
+多个实例可同时 Shadow，但只有一个实例可以被激活执行。配置和插件说明见
+[策略注册与实例管理](docs/strategy-management.md)。
+
+5 分钟普通/隐藏多指标背离反手候选策略可以离线回放：
+
+```powershell
+autotrade replay-strategy --instance divergence-btc-5m `
+  --database .autotrade/research.db --cooldown-bars 0
+```
+
+无重绘 Pivot、目标仓位状态机、两阶段反手和当前负收益基线见
+[5 分钟多指标背离反手策略](docs/multi-divergence-strategy.md)。该策略已完成工程实现，
+但尚无主网盈利资格。
+
+`lifecycle-pulse-testnet-v1` 每根新收盘 K 线都产生信号，仅用于快速验证
+Shadow → 信号门禁 → Testnet 下单 → 保护单 → 平仓/对账的工程链路，不用于评估盈利能力，
+且执行适配器会在主网环境明确拒绝它。
 
 ## 启动监督进程
 

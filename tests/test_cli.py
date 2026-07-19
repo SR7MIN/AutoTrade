@@ -129,6 +129,7 @@ class CliResearchTests(unittest.TestCase):
                 reference_price=Decimal("100"), stop_price=Decimal("90"),
                 take_profit_price=Decimal("120"), risk_usdt=Decimal("1"), leverage=3,
                 margin_utilization=Decimal("0.5"), indicators=(), reason="test",
+                instance_id="ema-default",
             )
             log.write_text(
                 json.dumps(
@@ -140,7 +141,10 @@ class CliResearchTests(unittest.TestCase):
                 encoding="utf-8",
             )
             args = build_parser().parse_args(
-                ["submit-strategy", "--log", str(log), "--execute"]
+                [
+                    "submit-strategy", "--instance", "ema-default",
+                    "--log", str(log), "--execute",
+                ]
             )
             with self.assertRaisesRegex(RuleViolation, "confirm-testnet"):
                 run(args)
@@ -156,6 +160,7 @@ class CliResearchTests(unittest.TestCase):
                 reference_price=Decimal("100"), stop_price=Decimal("90"),
                 take_profit_price=Decimal("120"), risk_usdt=Decimal("1"), leverage=3,
                 margin_utilization=Decimal("0.5"), indicators=(), reason="test",
+                instance_id="ema-default",
             )
             log.write_text(
                 json.dumps(
@@ -170,15 +175,21 @@ class CliResearchTests(unittest.TestCase):
             journal.set_control("entry_enabled", "true", "test")
             journal.set_control("user_stream_healthy", "true", "test")
             journal.set_control("market_data_BTCUSDT_5m_healthy", "true", "test")
+            journal.set_control("active_strategy_instance", "ema-default", "test")
             journal.close()
             settings = SimpleNamespace(
                 is_testnet=True,
                 risk=RiskSettings.from_env(),
                 lock_path=root / "writer.lock",
                 database_path=database,
+                strategy_config_path=Path("strategies.toml"),
+                strategy_state_dir=root / "strategies",
             )
             args = build_parser().parse_args(
-                ["submit-strategy", "--log", str(log)]
+                [
+                    "submit-strategy", "--instance", "ema-default",
+                    "--log", str(log),
+                ]
             )
             with (
                 patch("autotrade.cli.Settings.from_env", return_value=settings),
@@ -192,6 +203,70 @@ class CliResearchTests(unittest.TestCase):
                 self.assertEqual(journal.recent_commands(), [])
             finally:
                 journal.close()
+
+    def test_strategy_instance_can_be_listed_activated_and_deactivated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "orders.db"
+            config = root / "strategies.toml"
+            config.write_text(
+                """
+[instances.ema-test]
+implementation = "ema-atr-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "5m"
+
+[instances.ema-test.parameters]
+fast_period = 10
+slow_period = 30
+""",
+                encoding="utf-8",
+            )
+            settings = SimpleNamespace(
+                database_path=database,
+                strategy_config_path=config,
+                strategy_state_dir=root / "strategies",
+            )
+            list_args = build_parser().parse_args(
+                ["strategies", "--config", str(config)]
+            )
+            with (
+                patch("autotrade.cli.Settings.from_env", return_value=settings),
+                patch("autotrade.cli.print_json") as print_json,
+            ):
+                self.assertEqual(run(list_args), 0)
+            self.assertEqual(
+                print_json.call_args.args[0]["instances"][0]["instanceId"], "ema-test"
+            )
+
+            activate = build_parser().parse_args(
+                [
+                    "activate-strategy", "--instance", "ema-test",
+                    "--config", str(config), "--reason", "test activation",
+                ]
+            )
+            with (
+                patch("autotrade.cli.Settings.from_env", return_value=settings),
+                patch("autotrade.cli.print_json") as print_json,
+            ):
+                self.assertEqual(run(activate), 0)
+            self.assertEqual(
+                print_json.call_args.args[0]["activeExecutionInstance"], "ema-test"
+            )
+            self.assertFalse(print_json.call_args.args[0]["entryEnabled"])
+
+            deactivate = build_parser().parse_args(
+                ["deactivate-strategy", "--reason", "test complete"]
+            )
+            with (
+                patch("autotrade.cli.Settings.from_env", return_value=settings),
+                patch("autotrade.cli.print_json") as print_json,
+            ):
+                self.assertEqual(run(deactivate), 0)
+            self.assertIsNone(
+                print_json.call_args.args[0]["activeExecutionInstance"]
+            )
 
 
 if __name__ == "__main__":

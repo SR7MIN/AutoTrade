@@ -27,6 +27,7 @@ from .rules import SymbolRules, decimal_value
 from .shadow import ShadowRunner
 from .strategy import EmaAtrStrategy, build_strategy
 from .strategy_adapter import TestnetStrategyAdapter
+from .strategy_manager import StrategyManager
 from .trading import TradingService
 from .user_stream import stream_user_events
 
@@ -56,6 +57,13 @@ def timestamp_argument(value: str) -> int:
 
 def print_json(payload: Any, *, stream: Any = sys.stdout) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str), file=stream)
+
+
+def load_strategy_manager(settings: Settings, args: argparse.Namespace) -> StrategyManager:
+    config_path = getattr(args, "config", None) or settings.strategy_config_path
+    return StrategyManager.from_toml(
+        config_path, state_root=settings.strategy_state_dir
+    )
 
 
 def add_trade_arguments(parser: argparse.ArgumentParser) -> None:
@@ -187,38 +195,61 @@ def build_parser() -> argparse.ArgumentParser:
     replay = subparsers.add_parser(
         "replay-strategy", help="replay a deterministic strategy over stored closed klines"
     )
-    replay.add_argument("--strategy", choices=(EmaAtrStrategy.name,), default=EmaAtrStrategy.name)
-    replay.add_argument("--symbol", required=True)
-    replay.add_argument("--interval", default="5m")
+    replay.add_argument("--strategy")
+    replay.add_argument("--instance")
+    replay.add_argument("--config", type=Path)
+    replay.add_argument("--symbol")
+    replay.add_argument("--interval")
     replay.add_argument("--start", type=timestamp_argument)
     replay.add_argument("--end", type=timestamp_argument)
     replay.add_argument("--database", type=Path, default=Path(".autotrade/research.db"))
     replay.add_argument("--initial-balance", type=decimal_argument, default=Decimal("1000"))
     replay.add_argument("--fee-bps", type=decimal_argument, default=Decimal("5"))
     replay.add_argument("--slippage-bps", type=decimal_argument, default=Decimal("10"))
-    replay.add_argument("--cooldown-bars", type=int, default=3)
+    replay.add_argument("--cooldown-bars", type=int)
 
     shadow = subparsers.add_parser(
         "shadow", help="run a read-only strategy against newly closed local candles"
     )
-    shadow.add_argument("--strategy", choices=(EmaAtrStrategy.name,), default=EmaAtrStrategy.name)
-    shadow.add_argument("--symbol", required=True)
-    shadow.add_argument("--interval", default="5m")
+    shadow.add_argument("--strategy")
+    shadow.add_argument("--instance")
+    shadow.add_argument("--config", type=Path)
+    shadow.add_argument("--symbol")
+    shadow.add_argument("--interval")
     shadow.add_argument("--database", type=Path)
-    shadow.add_argument("--state", type=Path, default=Path(".autotrade/shadow-state.json"))
-    shadow.add_argument("--log", type=Path, default=Path(".autotrade/shadow.jsonl"))
+    shadow.add_argument("--state", type=Path)
+    shadow.add_argument("--log", type=Path)
     shadow.add_argument("--poll-seconds", type=float, default=5.0)
-    shadow.add_argument("--cooldown-bars", type=int, default=3)
+    shadow.add_argument("--cooldown-bars", type=int)
     shadow.add_argument("--once", action="store_true")
 
     submit = subparsers.add_parser(
         "submit-strategy", help="preview or queue an accepted Shadow signal on Testnet"
     )
-    submit.add_argument("--log", type=Path, default=Path(".autotrade/shadow.jsonl"))
+    submit.add_argument("--instance", required=True)
+    submit.add_argument("--config", type=Path)
+    submit.add_argument("--log", type=Path)
     submit.add_argument("--signal-id")
     submit.add_argument("--max-signal-age-seconds", type=int, default=90)
     submit.add_argument("--execute", action="store_true")
     submit.add_argument("--confirm-testnet", choices=("I_UNDERSTAND",))
+
+    strategies = subparsers.add_parser(
+        "strategies", help="list registered implementations and configured instances"
+    )
+    strategies.add_argument("--config", type=Path)
+
+    activate = subparsers.add_parser(
+        "activate-strategy", help="select the only strategy instance allowed to execute"
+    )
+    activate.add_argument("--instance", required=True)
+    activate.add_argument("--config", type=Path)
+    activate.add_argument("--reason", required=True)
+
+    deactivate = subparsers.add_parser(
+        "deactivate-strategy", help="disable strategy execution without changing entry pause"
+    )
+    deactivate.add_argument("--reason", required=True)
 
     journal = subparsers.add_parser("journal", help="show recent local trade intents")
     journal.add_argument("--limit", type=int, default=20)
@@ -275,6 +306,32 @@ def account_summary(client: BinanceRestClient) -> dict[str, Any]:
 
 def run(args: argparse.Namespace) -> int:
     settings = Settings.from_env(require_credentials=credentials_required(args))
+    if args.command in {"strategies", "activate-strategy", "deactivate-strategy"}:
+        journal = OrderJournal(settings.database_path)
+        try:
+            if args.command == "deactivate-strategy":
+                journal.set_control("active_strategy_instance", "", args.reason)
+                print_json({"activeExecutionInstance": None, "reason": args.reason})
+                return 0
+            manager = load_strategy_manager(settings, args)
+            if args.command == "strategies":
+                active = journal.get_control("active_strategy_instance", "") or None
+                print_json(manager.as_dict(active_instance=active))
+                return 0
+            instance = manager.instance(args.instance)
+            journal.set_control(
+                "active_strategy_instance", instance.instance_id, args.reason
+            )
+            print_json(
+                {
+                    "activeExecutionInstance": instance.instance_id,
+                    "entryEnabled": journal.get_control("entry_enabled", "false") == "true",
+                    "reason": args.reason,
+                }
+            )
+            return 0
+        finally:
+            journal.close()
     if args.command in {"journal", "audit", "commands", "pause-entry", "resume-entry"}:
         journal = OrderJournal(settings.database_path)
         try:
@@ -299,27 +356,40 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "replay-strategy":
+        if args.instance:
+            strategy = load_strategy_manager(settings, args).build(args.instance)
+        else:
+            strategy_name = args.strategy or EmaAtrStrategy.name
+            if not args.symbol:
+                raise ValueError("--symbol is required without --instance")
+            strategy = build_strategy(
+                strategy_name,
+                symbol=args.symbol,
+                interval=args.interval or "5m",
+            )
         journal = OrderJournal(args.database)
         try:
             candles = [
                 Candle.from_dict(value)
                 for value in journal.candles(
-                    args.symbol,
-                    args.interval,
+                    strategy.symbol,
+                    strategy.interval,
                     start_time=args.start,
                     end_time=args.end,
                 )
             ]
         finally:
             journal.close()
-        strategy = build_strategy(
-            args.strategy, symbol=args.symbol, interval=args.interval
+        cooldown_bars = (
+            args.cooldown_bars
+            if args.cooldown_bars is not None
+            else getattr(strategy, "cooldown_bars", 3)
         )
         result = BacktestEngine(
             initial_balance=args.initial_balance,
             fee_bps=args.fee_bps,
             slippage_bps=args.slippage_bps,
-            cooldown_bars=args.cooldown_bars,
+            cooldown_bars=cooldown_bars,
         ).run(candles, strategy)
         print_json({"database": str(args.database), **result.as_dict()})
         return 0
@@ -328,16 +398,36 @@ def run(args: argparse.Namespace) -> int:
         if args.poll_seconds <= 0:
             raise ValueError("poll seconds must be positive")
         database = args.database or settings.database_path
+        if args.instance:
+            manager = load_strategy_manager(settings, args)
+            strategy = manager.build(args.instance)
+            paths = manager.paths(args.instance)
+            state_path = args.state or paths.state
+            log_path = args.log or paths.log
+            shadow_lock = paths.lock
+        else:
+            strategy_name = args.strategy or EmaAtrStrategy.name
+            if not args.symbol:
+                raise ValueError("--symbol is required without --instance")
+            strategy = build_strategy(
+                strategy_name,
+                symbol=args.symbol,
+                interval=args.interval or "5m",
+            )
+            state_path = args.state or Path(".autotrade/shadow-state.json")
+            log_path = args.log or Path(".autotrade/shadow.jsonl")
+            shadow_lock = state_path.with_suffix(state_path.suffix + ".lock")
+        cooldown_bars = (
+            args.cooldown_bars
+            if args.cooldown_bars is not None
+            else getattr(strategy, "cooldown_bars", 3)
+        )
         runner = ShadowRunner(
             database_path=database,
-            state_path=args.state,
-            log_path=args.log,
-            cooldown_bars=args.cooldown_bars,
+            state_path=state_path,
+            log_path=log_path,
+            cooldown_bars=cooldown_bars,
         )
-        strategy = build_strategy(
-            args.strategy, symbol=args.symbol, interval=args.interval
-        )
-        shadow_lock = args.state.with_suffix(args.state.suffix + ".lock")
         if shadow_lock.resolve() == settings.lock_path.resolve():
             raise ValueError("shadow lock path cannot equal the daemon writer lock")
         with SingleInstanceLock(shadow_lock):
@@ -355,14 +445,45 @@ def run(args: argparse.Namespace) -> int:
             raise RuleViolation(
                 "--execute requires --confirm-testnet I_UNDERSTAND"
             )
-        signal = ShadowRunner.load_signal(args.log, args.signal_id)
+        manager = load_strategy_manager(settings, args)
+        instance = manager.instance(args.instance)
+        log_path = args.log or manager.paths(args.instance).log
+        strategy_decision = None
+        if instance.implementation == "multi-divergence-reversal-v1":
+            strategy_decision = ShadowRunner.load_decision(log_path, args.signal_id)
+            signal = strategy_decision.entry_signal
+        else:
+            signal = ShadowRunner.load_signal(log_path, args.signal_id)
+        if signal.instance_id != instance.instance_id:
+            raise RuleViolation("Shadow signal does not belong to the selected instance")
+        if (
+            signal.strategy != instance.implementation
+            or signal.symbol != instance.symbol
+            or signal.interval != instance.interval
+        ):
+            raise RuleViolation("Shadow signal does not match configured strategy instance")
         journal = OrderJournal(settings.database_path)
         try:
-            result = TestnetStrategyAdapter(settings, journal).submit(
-                signal,
-                execute=args.execute,
-                max_signal_age_seconds=args.max_signal_age_seconds,
+            registration = manager.registry.registration(instance.implementation)
+            result = TestnetStrategyAdapter(
+                settings,
+                journal,
+                instance,
+                registration.version,
+                testnet_only=registration.testnet_only,
             )
+            if strategy_decision is not None:
+                result = result.submit_decision(
+                    strategy_decision,
+                    execute=args.execute,
+                    max_signal_age_seconds=args.max_signal_age_seconds,
+                )
+            else:
+                result = result.submit(
+                    signal,
+                    execute=args.execute,
+                    max_signal_age_seconds=args.max_signal_age_seconds,
+                )
             print_json(result.as_dict())
         finally:
             journal.close()

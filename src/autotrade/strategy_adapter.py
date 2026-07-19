@@ -10,7 +10,8 @@ from .intents import EntryIntent
 from .journal import OrderJournal
 from .locking import lock_owner_active
 from .risk_control import RiskGovernor
-from .strategy import StrategySignal
+from .strategy import StrategyDecision, StrategySignal
+from .strategy_manager import StrategyInstanceConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,12 +20,16 @@ class StrategySubmission:
     signal_id: str
     intent: EntryIntent
     command_id: int | None
+    action: str = "ENTER"
+    decision_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
             "signalId": self.signal_id,
             "commandId": self.command_id,
+            "action": self.action,
+            "decisionId": self.decision_id,
             "intent": self.intent.as_dict(),
         }
 
@@ -32,14 +37,22 @@ class StrategySubmission:
 class TestnetStrategyAdapter:
     """Strict bridge from reviewed strategy signals to the daemon command queue."""
 
-    allowed_strategy = "ema-atr-v1"
-    allowed_symbol = "BTCUSDT"
     max_risk_usdt = 1
     max_leverage = 3
 
-    def __init__(self, settings: Settings, journal: OrderJournal) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        journal: OrderJournal,
+        instance: StrategyInstanceConfig,
+        implementation_version: str,
+        testnet_only: bool = False,
+    ) -> None:
         self.settings = settings
         self.journal = journal
+        self.instance = instance
+        self.implementation_version = implementation_version
+        self.testnet_only = testnet_only
 
     def submit(
         self,
@@ -86,15 +99,130 @@ class TestnetStrategyAdapter:
         )
         return StrategySubmission("queued", signal_id, intent, command_id)
 
+    def submit_decision(
+        self,
+        decision: StrategyDecision,
+        *,
+        execute: bool,
+        now_ms: int | None = None,
+        max_signal_age_seconds: int = 90,
+    ) -> StrategySubmission:
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        signal = decision.entry_signal
+        self._validate_signal(signal, now_ms, max_signal_age_seconds)
+        if (
+            decision.strategy != signal.strategy
+            or decision.version != signal.version
+            or decision.instance_id != signal.instance_id
+            or decision.symbol != signal.symbol
+            or decision.interval != signal.interval
+            or decision.candle_close_time != signal.candle_close_time
+        ):
+            raise RuleViolation("strategy decision does not match its entry signal")
+        RiskGovernor(self.settings.risk, self.journal).precheck(
+            requested_risk=signal.risk_usdt, leverage=signal.leverage
+        )
+        self._validate_local_health(signal, execute=execute)
+        decision_id = decision.decision_id
+        if self.journal.strategy_signal_command_exists(decision_id):
+            raise RuleViolation("strategy decision has already been submitted")
+        if self.journal.pending_entry_command_exists():
+            raise RuleViolation("another strategy entry or reversal is already pending")
+        active_intent = self.journal.latest_active_intent(signal.symbol)
+        active_orders = self.journal.active_orders(signal.symbol)
+        if decision.action == "ENTER":
+            if active_intent or active_orders:
+                raise RuleViolation(f"{signal.symbol} is not locally flat")
+        else:
+            if active_intent is None:
+                raise RuleViolation("strategy reversal requires an active local intent")
+            expected_side = "BUY" if decision.current_position == "LONG" else "SELL"
+            if str(active_intent.get("side")) != expected_side:
+                raise RuleViolation("strategy reversal does not match the active local side")
+            if not active_orders:
+                raise RuleViolation("strategy reversal requires active protection orders")
+        intent = EntryIntent.create(
+            source=(
+                f"strategy:{decision.strategy}:{decision.version}:"
+                f"{decision_id}:{decision.action.lower()}"
+            ),
+            symbol=signal.symbol,
+            side=signal.side,
+            risk_usdt=signal.risk_usdt,
+            stop_price=signal.stop_price,
+            take_profit_price=signal.take_profit_price,
+            leverage=signal.leverage,
+            margin_utilization=signal.margin_utilization,
+            ttl_seconds=30,
+        )
+        if not execute:
+            return StrategySubmission(
+                "preview",
+                signal.signal_id,
+                intent,
+                None,
+                action=decision.action,
+                decision_id=decision_id,
+            )
+        command_type = (
+            "STRATEGY_REVERSE" if decision.action == "REVERSE" else "ENTRY_INTENT"
+        )
+        payload = (
+            {
+                "symbol": signal.symbol,
+                "decisionId": decision_id,
+                "decision": decision.as_dict(),
+                "entryIntent": intent.as_dict(),
+            }
+            if command_type == "STRATEGY_REVERSE"
+            else intent.as_dict()
+        )
+        command_id = self.journal.enqueue_strategy_command(
+            decision_id, command_type, payload
+        )
+        if command_id is None:
+            raise RuleViolation("strategy decision could not be queued uniquely")
+        self.journal.append_audit(
+            "strategy",
+            f"{decision.action}_QUEUED",
+            symbol=signal.symbol,
+            correlation_id=decision_id,
+            payload={
+                "target_position": decision.target_position,
+                "command_id": command_id,
+            },
+        )
+        return StrategySubmission(
+            "queued",
+            signal.signal_id,
+            intent,
+            command_id,
+            action=decision.action,
+            decision_id=decision_id,
+        )
+
     def _validate_signal(
         self, signal: StrategySignal, now_ms: int, max_signal_age_seconds: int
     ) -> None:
+        if self.testnet_only and not self.settings.is_testnet:
+            raise ConfigurationError("strategy implementation is restricted to Testnet")
         if not self.settings.is_testnet:
             raise ConfigurationError("strategy execution adapter is restricted to Testnet")
-        if signal.strategy != self.allowed_strategy:
-            raise RuleViolation(f"strategy is not approved: {signal.strategy}")
-        if signal.symbol != self.allowed_symbol:
-            raise RuleViolation(f"strategy symbol is not approved: {signal.symbol}")
+        if not signal.instance_id:
+            raise RuleViolation("strategy signal has no configured instance ID")
+        if signal.instance_id != self.instance.instance_id:
+            raise RuleViolation("strategy signal does not match configured instance")
+        if signal.strategy != self.instance.implementation:
+            raise RuleViolation("strategy signal implementation does not match configuration")
+        if signal.version != self.implementation_version:
+            raise RuleViolation("strategy signal version does not match registry")
+        if signal.symbol != self.instance.symbol or signal.interval != self.instance.interval:
+            raise RuleViolation("strategy signal market does not match configuration")
+        active_instance = self.journal.get_control("active_strategy_instance", "")
+        if active_instance != signal.instance_id:
+            raise RuleViolation(
+                f"strategy instance is not active for execution: {signal.instance_id}"
+            )
         if signal.risk_usdt > self.max_risk_usdt:
             raise RuleViolation("strategy risk exceeds the 1 USDT Testnet cap")
         if signal.leverage > self.max_leverage:
@@ -110,13 +238,7 @@ class TestnetStrategyAdapter:
     def _validate_local_state(
         self, signal: StrategySignal, signal_id: str, *, execute: bool
     ) -> None:
-        if self.journal.get_control("entry_enabled", "false") != "true":
-            raise EntryPaused("new entries are paused")
-        if self.journal.get_control("user_stream_healthy", "false") != "true":
-            raise EntryPaused("user stream is not healthy")
-        market_key = f"market_data_{signal.symbol}_{signal.interval}_healthy"
-        if self.journal.get_control(market_key, "false") != "true":
-            raise EntryPaused("strategy market data stream is not healthy")
+        self._validate_local_health(signal, execute=execute)
         if self.journal.latest_active_intent(signal.symbol):
             raise RuleViolation(f"{signal.symbol} already has an active local intent")
         if self.journal.active_orders(signal.symbol):
@@ -125,6 +247,17 @@ class TestnetStrategyAdapter:
             raise RuleViolation("strategy signal has already been submitted")
         if self.journal.pending_entry_command_exists():
             raise RuleViolation("another entry intent is already pending")
+
+    def _validate_local_health(
+        self, signal: StrategySignal, *, execute: bool
+    ) -> None:
+        if self.journal.get_control("entry_enabled", "false") != "true":
+            raise EntryPaused("new entries are paused")
+        if self.journal.get_control("user_stream_healthy", "false") != "true":
+            raise EntryPaused("user stream is not healthy")
+        market_key = f"market_data_{signal.symbol}_{signal.interval}_healthy"
+        if self.journal.get_control(market_key, "false") != "true":
+            raise EntryPaused("strategy market data stream is not healthy")
         if execute and not lock_owner_active(self.settings.lock_path):
             raise RuleViolation("strategy execution requires a running daemon")
 

@@ -8,6 +8,7 @@ from typing import Any
 
 from .binance_rest import BinanceRestClient
 from .config import Settings
+from .errors import RuleViolation
 from .journal import OrderJournal
 from .intents import EntryIntent
 from .locking import SingleInstanceLock
@@ -429,6 +430,7 @@ class TradingDaemon:
         lock = SingleInstanceLock(self.settings.lock_path)
         lock.acquire()
         journal = OrderJournal(self.settings.database_path)
+        journal.recover_interrupted_strategy_reversals()
         client = BinanceRestClient(self.settings)
         logger = configure_logging(self.settings.log_path)
         alerts = AlertManager(journal, logger)
@@ -468,7 +470,10 @@ class TradingDaemon:
             while True:
                 commands = await asyncio.to_thread(journal.pending_commands)
                 for command in commands:
-                    if command["command_type"] == "ENTRY_INTENT" and not user_stream_ready.is_set():
+                    if command["command_type"] in {
+                        "ENTRY_INTENT",
+                        "STRATEGY_REVERSE",
+                    } and not user_stream_ready.is_set():
                         continue
                     command_id = int(command["id"])
                     if not journal.mark_command_running(command_id):
@@ -523,6 +528,93 @@ class TradingDaemon:
         if command_type == "ENTRY_INTENT":
             result = service.execute_intent(EntryIntent.from_dict(payload))
             return result.as_dict()
+        if command_type == "STRATEGY_REVERSE":
+            journal = service.journal
+            decision_id = str(payload["decisionId"])
+            decision = payload["decision"]
+            if not isinstance(decision, dict):
+                raise ValueError("strategy reversal decision must be an object")
+            entry_payload = payload["entryIntent"]
+            if not isinstance(entry_payload, dict):
+                raise ValueError("strategy reversal entry intent must be an object")
+            from_position = str(decision["currentPosition"])
+            target_position = str(decision["targetPosition"])
+            if from_position not in {"LONG", "SHORT"} or target_position not in {
+                "LONG",
+                "SHORT",
+            }:
+                raise ValueError("strategy reversal positions are invalid")
+            if from_position == target_position:
+                raise ValueError("strategy reversal target must oppose current position")
+            try:
+                positions = [
+                    item
+                    for item in service.client.positions(symbol, risk_reducing=True)
+                    if decimal_value(item.get("positionAmt", "0")) != 0
+                ]
+                if len(positions) > 1:
+                    raise RuleViolation("strategy reversal requires One-way Mode")
+                actual = "FLAT"
+                if positions:
+                    amount = decimal_value(positions[0]["positionAmt"])
+                    actual = "LONG" if amount > 0 else "SHORT"
+                if actual == target_position:
+                    journal.set_strategy_reversal_phase(
+                        decision_id,
+                        "ENTRY_CONFIRMED",
+                        {"recovered": True, "position": actual},
+                    )
+                    return {
+                        "decisionId": decision_id,
+                        "recovered": True,
+                        "targetPosition": target_position,
+                    }
+                close_result: dict[str, Any] | None = None
+                if actual == from_position:
+                    journal.set_strategy_reversal_phase(
+                        decision_id, "CLOSING", {"position": actual}
+                    )
+                    close_result = service.close_position(symbol)
+                    journal.set_strategy_reversal_phase(
+                        decision_id, "CLOSE_CONFIRMED", close_result
+                    )
+                elif actual == "FLAT":
+                    journal.set_strategy_reversal_phase(
+                        decision_id,
+                        "CLOSE_CONFIRMED",
+                        {"recovered": True, "position": "FLAT"},
+                    )
+                else:
+                    raise RuleViolation(
+                        f"strategy reversal expected {from_position}, found {actual}"
+                    )
+                remaining = [
+                    item
+                    for item in service.client.positions(symbol, risk_reducing=True)
+                    if decimal_value(item.get("positionAmt", "0")) != 0
+                ]
+                if remaining:
+                    raise RuleViolation("strategy reversal close was not confirmed flat")
+                journal.set_strategy_reversal_phase(
+                    decision_id, "ENTERING", {"target": target_position}
+                )
+                entry = service.execute_intent(EntryIntent.from_dict(entry_payload))
+                result = {
+                    "decisionId": decision_id,
+                    "close": close_result,
+                    "entry": entry.as_dict(),
+                    "targetPosition": target_position,
+                }
+                journal.set_strategy_reversal_phase(
+                    decision_id, "ENTRY_CONFIRMED", result
+                )
+                return result
+            except Exception as exc:
+                risk.lock_entries(f"strategy reversal failed: {decision_id}: {exc}")
+                journal.set_strategy_reversal_phase(
+                    decision_id, "FAILED", {"error": str(exc)}
+                )
+                raise
         if command_type == "CLOSE_POSITION":
             quantity = Decimal(payload["quantity"]) if payload.get("quantity") else None
             return service.close_position(symbol, quantity)
