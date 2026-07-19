@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
 from typing import Protocol
 
 from ..candles import Candle
@@ -60,10 +61,49 @@ class StrategySignal:
             "reason": self.reason,
         }
 
+    @property
+    def signal_id(self) -> str:
+        identity = ":".join(
+            (
+                self.strategy,
+                self.version,
+                self.symbol,
+                self.interval,
+                str(self.candle_close_time),
+                self.side,
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "StrategySignal":
+        indicators = payload.get("indicators") or {}
+        if not isinstance(indicators, dict):
+            raise ValueError("signal indicators must be an object")
+        return cls(
+            strategy=str(payload["strategy"]),
+            version=str(payload["version"]),
+            symbol=str(payload["symbol"]).upper(),
+            interval=str(payload["interval"]),
+            candle_open_time=int(payload["candleOpenTime"]),
+            candle_close_time=int(payload["candleCloseTime"]),
+            side=str(payload["side"]).upper(),
+            reference_price=Decimal(str(payload["referencePrice"])),
+            stop_price=Decimal(str(payload["stopPrice"])),
+            take_profit_price=Decimal(str(payload["takeProfitPrice"])),
+            risk_usdt=Decimal(str(payload["riskUsdt"])),
+            leverage=int(payload["leverage"]),
+            margin_utilization=Decimal(str(payload["marginUtilization"])),
+            indicators=tuple((str(key), str(value)) for key, value in indicators.items()),
+            reason=str(payload["reason"]),
+        )
+
 
 class Strategy(Protocol):
     name: str
     version: str
+    symbol: str
+    interval: str
 
     def reset(self) -> None: ...
 

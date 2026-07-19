@@ -173,6 +173,12 @@ class OrderJournal:
         );
         CREATE INDEX IF NOT EXISTS idx_operator_commands_status
             ON operator_commands(status, id);
+        CREATE TABLE IF NOT EXISTS strategy_submissions (
+            signal_id TEXT PRIMARY KEY,
+            command_id INTEGER NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(command_id) REFERENCES operator_commands(id)
+        );
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
@@ -753,6 +759,69 @@ class OrderJournal:
             item["payload"] = json.loads(item.pop("payload_json"))
             result.append(item)
         return result
+
+    def strategy_signal_command_exists(self, signal_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM strategy_submissions WHERE signal_id = ?", (signal_id,)
+            ).fetchone()
+        return row is not None
+
+    def pending_entry_command_exists(self) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM operator_commands
+                WHERE command_type = 'ENTRY_INTENT'
+                  AND status IN ('PENDING', 'RUNNING')
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def enqueue_strategy_signal(
+        self, signal_id: str, payload: dict[str, Any]
+    ) -> int | None:
+        now = utc_now()
+        with self._lock, self._connection:
+            if self._connection.execute(
+                """
+                SELECT 1 FROM operator_commands
+                WHERE command_type = 'ENTRY_INTENT'
+                  AND status IN ('PENDING', 'RUNNING')
+                LIMIT 1
+                """
+            ).fetchone():
+                return None
+            if self._connection.execute(
+                "SELECT 1 FROM strategy_submissions WHERE signal_id = ?", (signal_id,)
+            ).fetchone():
+                return None
+            cursor = self._connection.execute(
+                """
+                INSERT INTO operator_commands (
+                    command_type, payload_json, status, created_at, updated_at
+                ) VALUES ('ENTRY_INTENT', ?, 'PENDING', ?, ?)
+                """,
+                (_json(payload), now, now),
+            )
+            command_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO strategy_submissions(signal_id, command_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (signal_id, command_id, now),
+            )
+            self._append_audit_locked(
+                "operator_command",
+                "QUEUED",
+                payload.get("symbol"),
+                str(command_id),
+                "WARNING",
+                {"command_type": "ENTRY_INTENT", "signal_id": signal_id, **payload},
+            )
+        return command_id
 
     def mark_command_running(self, command_id: int) -> bool:
         with self._lock, self._connection:

@@ -28,6 +28,8 @@
 - `market_data.py`：行情去重、范围回补和 REST 断档补齐。
 - `strategy/`：无交易依赖的指标、策略契约和 EMA/ATR 工程验证策略。
 - `backtest.py`：下一根 K 线成交、保守同柱处理和成本模拟的离线回放。
+- `shadow.py`：只读实时决策、确定性状态重放和独立虚拟持仓状态。
+- `strategy_adapter.py`：Testnet 限定的信号门禁和 `EntryIntent` 队列适配。
 - `observability.py`：结构化 JSON 日志、敏感字段脱敏和持久化告警。
 
 ## 恢复模型

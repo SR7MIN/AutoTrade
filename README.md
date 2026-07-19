@@ -62,6 +62,16 @@ autotrade replay-strategy --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m -
 
 执行模型和限制见 [工程验证策略](docs/strategy-validation.md)。
 
+只读 Shadow 运行和显式 Testnet 信号提交：
+
+```powershell
+autotrade shadow --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m --database .autotrade/orders.db
+autotrade submit-strategy --log .autotrade/shadow.jsonl
+```
+
+Shadow 不会自动下单。提交命令默认仍是预览，实际入队必须同时使用 `--execute` 和
+`--confirm-testnet I_UNDERSTAND`，并通过全部健康、风险和重复信号门禁。
+
 ## 启动监督进程
 
 ```powershell

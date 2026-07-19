@@ -35,7 +35,7 @@
 - [x] UTC 历史范围分页回补、幂等存储和 K 线缺口报告。
 - [x] 无执行依赖的不可变 `StrategySignal`、EMA 和 Wilder ATR。
 - [x] 下一根 K 线成交、保守同柱处理和成本模拟的离线回放。
-- [ ] 实时 Shadow Runner、游标恢复和独立决策日志。
-- [ ] `StrategySignal` 到 `EntryIntent` 的 Testnet 执行适配器。
+- [x] 实时 Shadow Runner、游标恢复、虚拟状态和独立决策日志。
+- [x] `StrategySignal` 到 `EntryIntent` 的严格 Testnet 执行适配器。
 
 在所有部署项目都有证据、且账户仍锁定主网前，不应批准任何交易策略。

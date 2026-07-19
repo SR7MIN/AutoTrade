@@ -103,6 +103,33 @@ class JournalTests(unittest.TestCase):
         self.journal.complete_command(command_id, result={"ok": True})
         self.assertEqual(self.journal.recent_commands(1)[0]["status"], "COMPLETED")
 
+    def test_strategy_signal_is_enqueued_at_most_once(self) -> None:
+        payload = {
+            "intent_id": "intent-1",
+            "source": "strategy:ema-atr-v1:1:signal-1",
+            "symbol": "BTCUSDT",
+        }
+        first = self.journal.enqueue_strategy_signal("signal-1", payload)
+        second = self.journal.enqueue_strategy_signal("signal-1", payload)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(self.journal.strategy_signal_command_exists("signal-1"))
+        self.assertTrue(self.journal.pending_entry_command_exists())
+        self.assertEqual(len(self.journal.pending_commands()), 1)
+
+    def test_only_one_entry_intent_can_be_pending(self) -> None:
+        first = self.journal.enqueue_strategy_signal(
+            "signal-1",
+            {"intent_id": "intent-1", "source": "strategy:test:1:signal-1"},
+        )
+        second = self.journal.enqueue_strategy_signal(
+            "signal-2",
+            {"intent_id": "intent-2", "source": "strategy:test:1:signal-2"},
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(len(self.journal.pending_commands()), 1)
+
     def test_candles_are_deduplicated(self) -> None:
         candle = {
             "symbol": "BTCUSDT",

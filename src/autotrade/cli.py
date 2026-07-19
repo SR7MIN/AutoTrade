@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -15,16 +16,17 @@ from .binance_rest import BinanceRestClient
 from .candles import Candle
 from .config import Settings
 from .daemon import AccountReconciler, TradingDaemon
-from .errors import AutoTradeError
+from .errors import AutoTradeError, InstanceLockError, RuleViolation
 from .journal import OrderJournal
 from .intents import EntryIntent
-from .errors import InstanceLockError
 from .locking import SingleInstanceLock, lock_owner_active
 from .market_data import MarketDataService
 from .observability import AlertManager, configure_logging
 from .risk_control import RiskGovernor, utc_day_start_ms
 from .rules import SymbolRules, decimal_value
+from .shadow import ShadowRunner
 from .strategy import EmaAtrStrategy, build_strategy
+from .strategy_adapter import TestnetStrategyAdapter
 from .trading import TradingService
 from .user_stream import stream_user_events
 
@@ -196,6 +198,28 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--slippage-bps", type=decimal_argument, default=Decimal("10"))
     replay.add_argument("--cooldown-bars", type=int, default=3)
 
+    shadow = subparsers.add_parser(
+        "shadow", help="run a read-only strategy against newly closed local candles"
+    )
+    shadow.add_argument("--strategy", choices=(EmaAtrStrategy.name,), default=EmaAtrStrategy.name)
+    shadow.add_argument("--symbol", required=True)
+    shadow.add_argument("--interval", default="5m")
+    shadow.add_argument("--database", type=Path)
+    shadow.add_argument("--state", type=Path, default=Path(".autotrade/shadow-state.json"))
+    shadow.add_argument("--log", type=Path, default=Path(".autotrade/shadow.jsonl"))
+    shadow.add_argument("--poll-seconds", type=float, default=5.0)
+    shadow.add_argument("--cooldown-bars", type=int, default=3)
+    shadow.add_argument("--once", action="store_true")
+
+    submit = subparsers.add_parser(
+        "submit-strategy", help="preview or queue an accepted Shadow signal on Testnet"
+    )
+    submit.add_argument("--log", type=Path, default=Path(".autotrade/shadow.jsonl"))
+    submit.add_argument("--signal-id")
+    submit.add_argument("--max-signal-age-seconds", type=int, default=90)
+    submit.add_argument("--execute", action="store_true")
+    submit.add_argument("--confirm-testnet", choices=("I_UNDERSTAND",))
+
     journal = subparsers.add_parser("journal", help="show recent local trade intents")
     journal.add_argument("--limit", type=int, default=20)
     return parser
@@ -298,6 +322,50 @@ def run(args: argparse.Namespace) -> int:
             cooldown_bars=args.cooldown_bars,
         ).run(candles, strategy)
         print_json({"database": str(args.database), **result.as_dict()})
+        return 0
+
+    if args.command == "shadow":
+        if args.poll_seconds <= 0:
+            raise ValueError("poll seconds must be positive")
+        database = args.database or settings.database_path
+        runner = ShadowRunner(
+            database_path=database,
+            state_path=args.state,
+            log_path=args.log,
+            cooldown_bars=args.cooldown_bars,
+        )
+        strategy = build_strategy(
+            args.strategy, symbol=args.symbol, interval=args.interval
+        )
+        shadow_lock = args.state.with_suffix(args.state.suffix + ".lock")
+        if shadow_lock.resolve() == settings.lock_path.resolve():
+            raise ValueError("shadow lock path cannot equal the daemon writer lock")
+        with SingleInstanceLock(shadow_lock):
+            while True:
+                print_json({"database": str(database), **runner.run_once(strategy).as_dict()})
+                if args.once:
+                    return 0
+                try:
+                    time.sleep(args.poll_seconds)
+                except KeyboardInterrupt:
+                    return 0
+
+    if args.command == "submit-strategy":
+        if args.execute and args.confirm_testnet != "I_UNDERSTAND":
+            raise RuleViolation(
+                "--execute requires --confirm-testnet I_UNDERSTAND"
+            )
+        signal = ShadowRunner.load_signal(args.log, args.signal_id)
+        journal = OrderJournal(settings.database_path)
+        try:
+            result = TestnetStrategyAdapter(settings, journal).submit(
+                signal,
+                execute=args.execute,
+                max_signal_age_seconds=args.max_signal_age_seconds,
+            )
+            print_json(result.as_dict())
+        finally:
+            journal.close()
         return 0
 
     with BinanceRestClient(settings) as client:

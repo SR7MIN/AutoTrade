@@ -1,7 +1,8 @@
 # 工程验证策略
 
-本阶段只实现历史数据研究和离线回放，不包含实时 Shadow Runner，也不会把策略信号
-写入 daemon 命令队列。
+系统包含历史研究、离线回放、只读 Shadow Runner，以及严格限定在 Testnet 的显式
+信号提交适配器。Shadow 默认不会写 daemon 命令队列；只有人工选中已接受信号并提供
+双重执行确认时，才会创建会过期的 `EntryIntent`。
 
 ## 验证策略
 
@@ -46,3 +47,42 @@ autotrade replay-strategy --strategy ema-atr-v1 `
 
 该模型不模拟资金费率、强平、盘口深度、交易所价格和数量过滤器，也无法判断同一根
 K 线内部的真实价格路径。它用于验证策略流水线的确定性和安全边界，不构成盈利证据。
+
+## Shadow Runner
+
+Shadow 以 SQLite 只读模式打开行情库。首次运行只预热指标并把游标移动到最新已收盘
+K 线，不输出历史信号；之后只为新增 K 线记录决策：
+
+```powershell
+autotrade shadow --strategy ema-atr-v1 --symbol BTCUSDT --interval 5m `
+  --database .autotrade/orders.db
+```
+
+决策追加到 `.autotrade/shadow.jsonl`，游标、虚拟待入场、虚拟持仓和冷却状态原子保存
+到 `.autotrade/shadow-state.json`。运行器会从全部历史 K 线确定性重放内部状态，因此
+重启不依赖序列化 EMA/ATR 对象。Shadow 不调用 Binance 私有接口，不写交易数据库，
+也不创建 `operator_commands`。
+
+`--once` 只处理当前数据库快照后退出，适合验收和计划任务。持续模式默认每 5 秒轮询。
+Shadow 周期必须与 daemon 实际保存的周期一致；当前 daemon 若只保存 `1m`，需在后续
+部署窗口改为保存 `5m` 后再运行上述配置。
+
+## Testnet 信号提交
+
+先预览最近一条已接受的 Shadow 信号：
+
+```powershell
+autotrade submit-strategy --log .autotrade/shadow.jsonl
+```
+
+显式提交到正在运行的 Testnet daemon：
+
+```powershell
+autotrade submit-strategy --log .autotrade/shadow.jsonl `
+  --signal-id SIGNAL_ID --execute --confirm-testnet I_UNDERSTAND
+```
+
+适配器仅批准 `ema-atr-v1`、`BTCUSDT`、不超过 1 USDT 风险和 3 倍杠杆。信号必须新鲜，
+入口必须已人工解锁，用户流和对应行情流必须健康，本地不得已有活动意图或订单，且
+daemon 必须持有写锁。重复信号不能再次提交。入队后，现有 `RiskGovernor`、交易所仓位
+检查和规则校验仍会在真正执行前再次运行。主网无条件拒绝该适配器。

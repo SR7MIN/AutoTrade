@@ -1,13 +1,17 @@
 import tempfile
 import unittest
+import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from autotrade.cli import build_parser, run, timestamp_argument
-from autotrade.errors import InstanceLockError
+from autotrade.config import RiskSettings
+from autotrade.errors import InstanceLockError, RuleViolation
 from autotrade.journal import OrderJournal
 from autotrade.market_data import Candle
+from autotrade.strategy.base import StrategySignal
 
 
 class CliResearchTests(unittest.TestCase):
@@ -81,6 +85,113 @@ class CliResearchTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(InstanceLockError, "daemon is active"):
                     run(args)
+
+    def test_shadow_once_warms_up_without_writing_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "market.db"
+            state = root / "shadow-state.json"
+            log = root / "shadow.jsonl"
+            journal = OrderJournal(database)
+            try:
+                for index in range(60):
+                    price = 100 + index % 10
+                    journal.store_candle(
+                        Candle(
+                            symbol="BTCUSDT", interval="5m",
+                            open_time=index * 300_000,
+                            close_time=(index + 1) * 300_000 - 1,
+                            open=str(price), high=str(price + 1), low=str(price - 1),
+                            close=str(price), volume="10", trade_count=1, closed=True,
+                        ).as_dict()
+                    )
+            finally:
+                journal.close()
+            args = build_parser().parse_args(
+                [
+                    "shadow", "--strategy", "ema-atr-v1", "--symbol", "BTCUSDT",
+                    "--interval", "5m", "--database", str(database),
+                    "--state", str(state), "--log", str(log), "--once",
+                ]
+            )
+            with patch("autotrade.cli.print_json") as print_json:
+                self.assertEqual(run(args), 0)
+            self.assertEqual(print_json.call_args.args[0]["signalsEmitted"], 0)
+            self.assertTrue(state.exists())
+            self.assertFalse(log.exists())
+
+    def test_submit_execute_requires_explicit_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "shadow.jsonl"
+            signal = StrategySignal(
+                strategy="ema-atr-v1", version="1", symbol="BTCUSDT", interval="5m",
+                candle_open_time=1, candle_close_time=2, side="BUY",
+                reference_price=Decimal("100"), stop_price=Decimal("90"),
+                take_profit_price=Decimal("120"), risk_usdt=Decimal("1"), leverage=3,
+                margin_utilization=Decimal("0.5"), indicators=(), reason="test",
+            )
+            log.write_text(
+                json.dumps(
+                    {
+                        "event": "SHADOW_SIGNAL", "decision": "ACCEPTED",
+                        "signalId": "id", "signal": signal.as_dict(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = build_parser().parse_args(
+                ["submit-strategy", "--log", str(log), "--execute"]
+            )
+            with self.assertRaisesRegex(RuleViolation, "confirm-testnet"):
+                run(args)
+
+    def test_submit_preview_loads_only_accepted_shadow_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "shadow.jsonl"
+            database = root / "orders.db"
+            signal = StrategySignal(
+                strategy="ema-atr-v1", version="1", symbol="BTCUSDT", interval="5m",
+                candle_open_time=700_001, candle_close_time=1_000_000, side="BUY",
+                reference_price=Decimal("100"), stop_price=Decimal("90"),
+                take_profit_price=Decimal("120"), risk_usdt=Decimal("1"), leverage=3,
+                margin_utilization=Decimal("0.5"), indicators=(), reason="test",
+            )
+            log.write_text(
+                json.dumps(
+                    {
+                        "event": "SHADOW_SIGNAL", "decision": "ACCEPTED",
+                        "signalId": signal.signal_id, "signal": signal.as_dict(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            journal = OrderJournal(database)
+            journal.set_control("entry_enabled", "true", "test")
+            journal.set_control("user_stream_healthy", "true", "test")
+            journal.set_control("market_data_BTCUSDT_5m_healthy", "true", "test")
+            journal.close()
+            settings = SimpleNamespace(
+                is_testnet=True,
+                risk=RiskSettings.from_env(),
+                lock_path=root / "writer.lock",
+                database_path=database,
+            )
+            args = build_parser().parse_args(
+                ["submit-strategy", "--log", str(log)]
+            )
+            with (
+                patch("autotrade.cli.Settings.from_env", return_value=settings),
+                patch("autotrade.strategy_adapter.time.time", return_value=1001),
+                patch("autotrade.cli.print_json") as print_json,
+            ):
+                self.assertEqual(run(args), 0)
+            self.assertEqual(print_json.call_args.args[0]["mode"], "preview")
+            journal = OrderJournal(database)
+            try:
+                self.assertEqual(journal.recent_commands(), [])
+            finally:
+                journal.close()
 
 
 if __name__ == "__main__":
