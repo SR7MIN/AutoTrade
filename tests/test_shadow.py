@@ -10,6 +10,7 @@ from autotrade.shadow import ShadowRunner
 from autotrade.strategy.base import (
     DivergenceEvidence,
     StrategyDecision,
+    StrategyExitDecision,
     StrategySignal,
 )
 from autotrade.strategy.lifecycle_pulse import LifecyclePulseStrategy
@@ -38,8 +39,9 @@ class FixedStrategy:
     interval = "5m"
     instance_id = "fixed-test"
 
-    def __init__(self, indexes):
+    def __init__(self, indexes, *, take_profit=Decimal("120")):
         self.indexes = set(indexes)
+        self.take_profit = take_profit
 
     def reset(self):
         return None
@@ -58,7 +60,7 @@ class FixedStrategy:
             side="BUY",
             reference_price=Decimal("100"),
             stop_price=Decimal("90"),
-            take_profit_price=Decimal("120"),
+            take_profit_price=self.take_profit,
             risk_usdt=Decimal("1"),
             leverage=3,
             margin_utilization=Decimal("0.5"),
@@ -150,6 +152,27 @@ class FixedDecisionStrategy:
         return None
 
 
+class FixedExitDecisionStrategy(FixedDecisionStrategy):
+    def on_candle(self, value):
+        index = value.open_time // 300_000
+        if index == 2 and self.position == "LONG":
+            return StrategyExitDecision(
+                strategy=self.name,
+                version=self.version,
+                instance_id=self.instance_id,
+                symbol=value.symbol,
+                interval=value.interval,
+                candle_open_time=value.open_time,
+                candle_close_time=value.close_time,
+                current_position="LONG",
+                bullish_count=0,
+                bearish_count=0,
+                evidence=(),
+                reason="fixture exit",
+            )
+        return super().on_candle(value)
+
+
 class ShadowRunnerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -199,6 +222,17 @@ class ShadowRunnerTests(unittest.TestCase):
         repeated = self.runner.run_once(FixedStrategy({2}))
         self.assertEqual(repeated.signals_emitted, 0)
         self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_stop_only_virtual_position_ignores_favorable_high(self):
+        self.store(candle(0))
+        self.runner.run_once(FixedStrategy(set(), take_profit=None))
+        self.store(candle(1))
+        self.runner.run_once(FixedStrategy({1}, take_profit=None))
+        self.store(candle(2, high="500", low="95", close="300"))
+        result = self.runner.run_once(FixedStrategy({1}, take_profit=None))
+        self.assertIsNotNone(result.virtual_position)
+        assert result.virtual_position is not None
+        self.assertIsNone(result.virtual_position["takeProfitPrice"])
 
     def test_virtual_position_and_cooldown_are_replayed_after_restart(self):
         self.store(candle(0), candle(1))
@@ -286,6 +320,26 @@ class ShadowRunnerTests(unittest.TestCase):
         loaded = ShadowRunner.load_decision(self.log, lines[-1]["decisionId"])
         self.assertEqual(loaded.action, "REVERSE")
         self.assertEqual(loaded.target_position, "SHORT")
+
+    def test_shadow_logs_exit_and_closes_virtual_position_next_open(self):
+        self.store(candle(0))
+        self.runner.run_once(FixedExitDecisionStrategy())
+        self.store(candle(1))
+        self.runner.run_once(FixedExitDecisionStrategy())
+        self.store(candle(2))
+        exited = self.runner.run_once(FixedExitDecisionStrategy())
+        self.assertEqual(exited.signals_accepted, 1)
+        lines = [
+            json.loads(line)
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(lines[-1]["decision"], "EXIT_ACCEPTED")
+        self.assertNotIn("signal", lines[-1])
+        loaded = ShadowRunner.load_decision(self.log, lines[-1]["decisionId"])
+        self.assertEqual(loaded.action, "EXIT")
+        self.store(candle(3))
+        closed = self.runner.run_once(FixedExitDecisionStrategy())
+        self.assertIsNone(closed.virtual_position)
 
 
 if __name__ == "__main__":

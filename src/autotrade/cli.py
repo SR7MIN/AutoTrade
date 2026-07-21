@@ -451,17 +451,22 @@ def run(args: argparse.Namespace) -> int:
         strategy_decision = None
         if instance.implementation == "multi-divergence-reversal-v1":
             strategy_decision = ShadowRunner.load_decision(log_path, args.signal_id)
-            signal = strategy_decision.entry_signal
+            signal = (
+                strategy_decision.entry_signal
+                if hasattr(strategy_decision, "entry_signal")
+                else None
+            )
         else:
             signal = ShadowRunner.load_signal(log_path, args.signal_id)
-        if signal.instance_id != instance.instance_id:
-            raise RuleViolation("Shadow signal does not belong to the selected instance")
-        if (
-            signal.strategy != instance.implementation
-            or signal.symbol != instance.symbol
-            or signal.interval != instance.interval
-        ):
-            raise RuleViolation("Shadow signal does not match configured strategy instance")
+        if signal is not None:
+            if signal.instance_id != instance.instance_id:
+                raise RuleViolation("Shadow signal does not belong to the selected instance")
+            if (
+                signal.strategy != instance.implementation
+                or signal.symbol != instance.symbol
+                or signal.interval != instance.interval
+            ):
+                raise RuleViolation("Shadow signal does not match configured strategy instance")
         journal = OrderJournal(settings.database_path)
         try:
             registration = manager.registry.registration(instance.implementation)
@@ -471,6 +476,7 @@ def run(args: argparse.Namespace) -> int:
                 instance,
                 registration.version,
                 testnet_only=registration.testnet_only,
+                research_only=registration.research_only,
             )
             if strategy_decision is not None:
                 result = result.submit_decision(

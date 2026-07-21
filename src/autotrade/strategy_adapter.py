@@ -10,7 +10,7 @@ from .intents import EntryIntent
 from .journal import OrderJournal
 from .locking import lock_owner_active
 from .risk_control import RiskGovernor
-from .strategy import StrategyDecision, StrategySignal
+from .strategy import StrategyDecision, StrategyExitDecision, StrategySignal
 from .strategy_manager import StrategyInstanceConfig
 
 
@@ -18,7 +18,7 @@ from .strategy_manager import StrategyInstanceConfig
 class StrategySubmission:
     mode: str
     signal_id: str
-    intent: EntryIntent
+    intent: EntryIntent | None
     command_id: int | None
     action: str = "ENTER"
     decision_id: str | None = None
@@ -30,7 +30,7 @@ class StrategySubmission:
             "commandId": self.command_id,
             "action": self.action,
             "decisionId": self.decision_id,
-            "intent": self.intent.as_dict(),
+            "intent": self.intent.as_dict() if self.intent is not None else None,
         }
 
 
@@ -47,12 +47,14 @@ class TestnetStrategyAdapter:
         instance: StrategyInstanceConfig,
         implementation_version: str,
         testnet_only: bool = False,
+        research_only: bool = False,
     ) -> None:
         self.settings = settings
         self.journal = journal
         self.instance = instance
         self.implementation_version = implementation_version
         self.testnet_only = testnet_only
+        self.research_only = research_only
 
     def submit(
         self,
@@ -78,6 +80,8 @@ class TestnetStrategyAdapter:
             take_profit_price=signal.take_profit_price,
             leverage=signal.leverage,
             margin_utilization=signal.margin_utilization,
+            min_stop_bps=self._minimum_stop_bps(signal),
+            max_stop_bps=self._maximum_stop_bps(signal),
             ttl_seconds=30,
         )
         if not execute:
@@ -101,13 +105,20 @@ class TestnetStrategyAdapter:
 
     def submit_decision(
         self,
-        decision: StrategyDecision,
+        decision: StrategyDecision | StrategyExitDecision,
         *,
         execute: bool,
         now_ms: int | None = None,
         max_signal_age_seconds: int = 90,
     ) -> StrategySubmission:
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        if isinstance(decision, StrategyExitDecision):
+            return self._submit_exit_decision(
+                decision,
+                execute=execute,
+                now_ms=now_ms,
+                max_signal_age_seconds=max_signal_age_seconds,
+            )
         signal = decision.entry_signal
         self._validate_signal(signal, now_ms, max_signal_age_seconds)
         if (
@@ -153,6 +164,8 @@ class TestnetStrategyAdapter:
             take_profit_price=signal.take_profit_price,
             leverage=signal.leverage,
             margin_utilization=signal.margin_utilization,
+            min_stop_bps=self._minimum_stop_bps(signal),
+            max_stop_bps=self._maximum_stop_bps(signal),
             ttl_seconds=30,
         )
         if not execute:
@@ -201,13 +214,107 @@ class TestnetStrategyAdapter:
             decision_id=decision_id,
         )
 
+    def _submit_exit_decision(
+        self,
+        decision: StrategyExitDecision,
+        *,
+        execute: bool,
+        now_ms: int,
+        max_signal_age_seconds: int,
+    ) -> StrategySubmission:
+        if self.research_only:
+            raise RuleViolation("research-only strategy decisions cannot be submitted")
+        if not self.settings.is_testnet:
+            raise ConfigurationError("strategy execution adapter is restricted to Testnet")
+        if (
+            decision.instance_id != self.instance.instance_id
+            or decision.strategy != self.instance.implementation
+            or decision.version != self.implementation_version
+            or decision.symbol != self.instance.symbol
+            or decision.interval != self.instance.interval
+        ):
+            raise RuleViolation("strategy exit decision does not match configuration")
+        if max_signal_age_seconds < 1 or max_signal_age_seconds > 300:
+            raise ValueError("max signal age must be between 1 and 300 seconds")
+        age = now_ms - decision.candle_close_time
+        if age < -1000:
+            raise RuleViolation("strategy exit candle close time is in the future")
+        if age > max_signal_age_seconds * 1000:
+            raise RuleViolation("strategy exit decision is stale")
+        active_instance = self.journal.get_control("active_strategy_instance", "")
+        if active_instance != decision.instance_id:
+            raise RuleViolation(
+                f"strategy instance is not active for execution: {decision.instance_id}"
+            )
+        if self.journal.get_control("user_stream_healthy", "false") != "true":
+            raise EntryPaused("user stream is not healthy")
+        market_key = f"market_data_{decision.symbol}_{decision.interval}_healthy"
+        if self.journal.get_control(market_key, "false") != "true":
+            raise EntryPaused("strategy market data stream is not healthy")
+        if execute and not lock_owner_active(self.settings.lock_path):
+            raise RuleViolation("strategy execution requires a running daemon")
+        active_intent = self.journal.latest_active_intent(decision.symbol)
+        active_orders = self.journal.active_orders(decision.symbol)
+        if active_intent is None or not active_orders:
+            raise RuleViolation("strategy exit requires an active protected local position")
+        expected_side = "BUY" if decision.current_position == "LONG" else "SELL"
+        if str(active_intent.get("side")) != expected_side:
+            raise RuleViolation("strategy exit does not match the active local side")
+        decision_id = decision.decision_id
+        if self.journal.strategy_signal_command_exists(decision_id):
+            raise RuleViolation("strategy exit decision has already been submitted")
+        if self.journal.pending_entry_command_exists():
+            raise RuleViolation("another strategy command is already pending")
+        if not execute:
+            return StrategySubmission(
+                "preview",
+                decision_id,
+                None,
+                None,
+                action="EXIT",
+                decision_id=decision_id,
+            )
+        payload = {
+            "symbol": decision.symbol,
+            "decisionId": decision_id,
+            "decision": decision.as_dict(),
+        }
+        command_id = self.journal.enqueue_strategy_command(
+            decision_id, "STRATEGY_EXIT", payload
+        )
+        if command_id is None:
+            raise RuleViolation("strategy exit decision could not be queued uniquely")
+        self.journal.append_audit(
+            "strategy",
+            "EXIT_QUEUED",
+            symbol=decision.symbol,
+            correlation_id=decision_id,
+            payload={"command_id": command_id},
+        )
+        return StrategySubmission(
+            "queued",
+            decision_id,
+            None,
+            command_id,
+            action="EXIT",
+            decision_id=decision_id,
+        )
+
     def _validate_signal(
         self, signal: StrategySignal, now_ms: int, max_signal_age_seconds: int
     ) -> None:
+        if self.research_only:
+            raise RuleViolation("research-only strategy signals cannot be submitted")
         if self.testnet_only and not self.settings.is_testnet:
             raise ConfigurationError("strategy implementation is restricted to Testnet")
         if not self.settings.is_testnet:
             raise ConfigurationError("strategy execution adapter is restricted to Testnet")
+        if dict(signal.indicators).get("position_size_mode") == "full_equity":
+            raise RuleViolation(
+                "full-equity strategy signals are research-only and cannot be submitted"
+            )
+        if signal.stop_price is None:
+            raise RuleViolation("strategy execution requires an exchange-side stop")
         if not signal.instance_id:
             raise RuleViolation("strategy signal has no configured instance ID")
         if signal.instance_id != self.instance.instance_id:
@@ -234,6 +341,22 @@ class TestnetStrategyAdapter:
             raise RuleViolation("strategy signal candle close time is in the future")
         if age > max_signal_age_seconds * 1000:
             raise RuleViolation("strategy signal is stale")
+
+    @staticmethod
+    def _minimum_stop_bps(signal: StrategySignal) -> Decimal | None:
+        value = dict(signal.indicators).get("min_stop_bps")
+        if value is None:
+            return None
+        result = Decimal(value)
+        return result if result > 0 else None
+
+    @staticmethod
+    def _maximum_stop_bps(signal: StrategySignal) -> Decimal | None:
+        value = dict(signal.indicators).get("max_stop_bps")
+        if value is None:
+            return None
+        result = Decimal(value)
+        return result if result > 0 else None
 
     def _validate_local_state(
         self, signal: StrategySignal, signal_id: str, *, execute: bool

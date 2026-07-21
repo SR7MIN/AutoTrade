@@ -107,6 +107,46 @@ class TradingServiceTests(unittest.TestCase):
             finally:
                 journal.close()
 
+    def test_rejects_actual_stop_distance_below_strategy_minimum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = self.make_journal(directory)
+            client = FakeClient()
+            try:
+                service = TradingService(client, journal)
+                with self.assertRaisesRegex(RuleViolation, "below the strategy minimum"):
+                    service.place_market_bracket(
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        risk_usdt=Decimal("1"),
+                        stop_price=Decimal("49000"),
+                        take_profit_price=None,
+                        leverage=3,
+                        min_stop_bps=Decimal("300"),
+                    )
+                self.assertEqual(client.orders, [])
+            finally:
+                journal.close()
+
+    def test_rejects_actual_stop_distance_above_strategy_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = self.make_journal(directory)
+            client = FakeClient()
+            try:
+                service = TradingService(client, journal)
+                with self.assertRaisesRegex(RuleViolation, "exceeds the strategy maximum"):
+                    service.place_market_bracket(
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        risk_usdt=Decimal("1"),
+                        stop_price=Decimal("49000"),
+                        take_profit_price=None,
+                        leverage=3,
+                        max_stop_bps=Decimal("100"),
+                    )
+                self.assertEqual(client.orders, [])
+            finally:
+                journal.close()
+
     def test_all_client_id_kinds_fit_binance_limit(self) -> None:
         for kind in ("entry", "stop", "take-profit", "emergency", "a-very-long-kind-name"):
             identifier = client_id(kind)

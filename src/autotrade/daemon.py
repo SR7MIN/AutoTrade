@@ -310,8 +310,8 @@ class AccountReconciler:
         position = positions[0]
         stop_orders = [order for order in algo if _algo_role(order) == "STOP"]
         take_profit_orders = [order for order in algo if _algo_role(order) == "TAKE_PROFIT"]
+        latest = self.journal.latest_active_intent(symbol)
         if not stop_orders:
-            latest = self.journal.latest_active_intent(symbol)
             if latest and latest.get("stop_price"):
                 self.alerts.emit(
                     "PROTECTION_RECOVERY",
@@ -351,7 +351,8 @@ class AccountReconciler:
                 severity="CRITICAL",
                 payload={"breaches": breaches},
             )
-        if not take_profit_orders:
+        take_profit_expected = bool(latest and latest.get("take_profit_price"))
+        if take_profit_expected and not take_profit_orders:
             self.alerts.emit(
                 "MISSING_TAKE_PROFIT",
                 "Position has a stop but no take-profit",
@@ -473,6 +474,7 @@ class TradingDaemon:
                     if command["command_type"] in {
                         "ENTRY_INTENT",
                         "STRATEGY_REVERSE",
+                        "STRATEGY_EXIT",
                     } and not user_stream_ready.is_set():
                         continue
                     command_id = int(command["id"])
@@ -615,6 +617,30 @@ class TradingDaemon:
                     decision_id, "FAILED", {"error": str(exc)}
                 )
                 raise
+        if command_type == "STRATEGY_EXIT":
+            decision = payload.get("decision")
+            if not isinstance(decision, dict):
+                raise ValueError("strategy exit decision must be an object")
+            expected = str(decision.get("currentPosition") or "")
+            if expected not in {"LONG", "SHORT"}:
+                raise ValueError("strategy exit current position is invalid")
+            positions = [
+                item
+                for item in service.client.positions(symbol, risk_reducing=True)
+                if decimal_value(item.get("positionAmt", "0")) != 0
+            ]
+            if len(positions) != 1:
+                raise RuleViolation("strategy exit requires exactly one active position")
+            amount = decimal_value(positions[0]["positionAmt"])
+            actual = "LONG" if amount > 0 else "SHORT"
+            if actual != expected:
+                raise RuleViolation(
+                    f"strategy exit expected {expected}, found {actual}"
+                )
+            return {
+                "decisionId": str(payload["decisionId"]),
+                "exit": service.close_position(symbol),
+            }
         if command_type == "CLOSE_POSITION":
             quantity = Decimal(payload["quantity"]) if payload.get("quantity") else None
             return service.close_position(symbol, quantity)

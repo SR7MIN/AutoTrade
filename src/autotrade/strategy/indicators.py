@@ -4,6 +4,55 @@ from collections import deque
 from decimal import Decimal
 
 
+class PineExponentialMovingAverage:
+    """TradingView/Pine EMA: seed from the first non-na source value."""
+
+    def __init__(self, period: int) -> None:
+        if period < 1:
+            raise ValueError("EMA period must be positive")
+        self.period = period
+        self._alpha = Decimal(2) / Decimal(period + 1)
+        self.value: Decimal | None = None
+
+    def reset(self) -> None:
+        self.value = None
+
+    def update(self, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        value = Decimal(value)
+        if self.value is None:
+            self.value = value
+        else:
+            self.value = self._alpha * value + (Decimal(1) - self._alpha) * self.value
+        return self.value
+
+
+class PineSimpleMovingAverage:
+    """Pine SMA semantics: na source values are ignored."""
+
+    def __init__(self, period: int) -> None:
+        if period < 1:
+            raise ValueError("SMA period must be positive")
+        self.period = period
+        self.reset()
+
+    def reset(self) -> None:
+        self._values: deque[Decimal] = deque()
+        self._total = Decimal(0)
+
+    def update(self, value: Decimal | None) -> Decimal | None:
+        if value is not None:
+            decimal_value = Decimal(value)
+            self._values.append(decimal_value)
+            self._total += decimal_value
+            if len(self._values) > self.period:
+                self._total -= self._values.popleft()
+        if len(self._values) < self.period:
+            return None
+        return self._total / Decimal(self.period)
+
+
 class ExponentialMovingAverage:
     def __init__(self, period: int) -> None:
         if period < 1:
@@ -69,6 +118,98 @@ class WilderAverageTrueRange:
         return self.value
 
 
+class WilderDirectionalMovementIndex:
+    """Wilder DMI/ADX with an SMA seed followed by Wilder smoothing."""
+
+    def __init__(self, period: int = 14) -> None:
+        if period < 1:
+            raise ValueError("ADX period must be positive")
+        self.period = period
+        self.reset()
+
+    def reset(self) -> None:
+        self._previous_high: Decimal | None = None
+        self._previous_low: Decimal | None = None
+        self._previous_close: Decimal | None = None
+        self._tr_seed: list[Decimal] = []
+        self._plus_seed: list[Decimal] = []
+        self._minus_seed: list[Decimal] = []
+        self._dx_seed: list[Decimal] = []
+        self._smoothed_tr: Decimal | None = None
+        self._smoothed_plus: Decimal | None = None
+        self._smoothed_minus: Decimal | None = None
+        self.value: Decimal | None = None
+
+    def update(
+        self, high: Decimal, low: Decimal, close: Decimal
+    ) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+        high = Decimal(high)
+        low = Decimal(low)
+        close = Decimal(close)
+        if high < low:
+            raise ValueError("candle high cannot be below low")
+        if self._previous_close is None:
+            self._previous_high = high
+            self._previous_low = low
+            self._previous_close = close
+            return None, None, None
+
+        assert self._previous_high is not None and self._previous_low is not None
+        true_range = max(
+            high - low,
+            abs(high - self._previous_close),
+            abs(low - self._previous_close),
+        )
+        up_move = high - self._previous_high
+        down_move = self._previous_low - low
+        plus_dm = up_move if up_move > down_move and up_move > 0 else Decimal(0)
+        minus_dm = down_move if down_move > up_move and down_move > 0 else Decimal(0)
+        self._previous_high = high
+        self._previous_low = low
+        self._previous_close = close
+
+        if self._smoothed_tr is None:
+            self._tr_seed.append(true_range)
+            self._plus_seed.append(plus_dm)
+            self._minus_seed.append(minus_dm)
+            if len(self._tr_seed) < self.period:
+                return None, None, None
+            self._smoothed_tr = sum(self._tr_seed, Decimal(0))
+            self._smoothed_plus = sum(self._plus_seed, Decimal(0))
+            self._smoothed_minus = sum(self._minus_seed, Decimal(0))
+            self._tr_seed.clear()
+            self._plus_seed.clear()
+            self._minus_seed.clear()
+        else:
+            assert self._smoothed_plus is not None and self._smoothed_minus is not None
+            divisor = Decimal(self.period)
+            self._smoothed_tr = self._smoothed_tr - self._smoothed_tr / divisor + true_range
+            self._smoothed_plus = (
+                self._smoothed_plus - self._smoothed_plus / divisor + plus_dm
+            )
+            self._smoothed_minus = (
+                self._smoothed_minus - self._smoothed_minus / divisor + minus_dm
+            )
+
+        if self._smoothed_tr == 0:
+            return self.value, None, None
+        plus_di = Decimal(100) * self._smoothed_plus / self._smoothed_tr
+        minus_di = Decimal(100) * self._smoothed_minus / self._smoothed_tr
+        total = plus_di + minus_di
+        dx = Decimal(0) if total == 0 else Decimal(100) * abs(plus_di - minus_di) / total
+        if self.value is None:
+            self._dx_seed.append(dx)
+            if len(self._dx_seed) < self.period:
+                return None, plus_di, minus_di
+            self.value = sum(self._dx_seed, Decimal(0)) / Decimal(self.period)
+            self._dx_seed.clear()
+        else:
+            self.value = (
+                self.value * Decimal(self.period - 1) + dx
+            ) / Decimal(self.period)
+        return self.value, plus_di, minus_di
+
+
 class SimpleMovingAverage:
     def __init__(self, period: int) -> None:
         if period < 1:
@@ -131,7 +272,9 @@ class RelativeStrengthIndex:
                 self._average_loss * Decimal(self.period - 1) + loss
             ) / Decimal(self.period)
         if self._average_loss == 0:
-            return Decimal(100) if self._average_gain > 0 else Decimal(50)
+            return Decimal(100) if self._average_gain > 0 else None
+        if self._average_gain == 0:
+            return Decimal(0)
         relative_strength = self._average_gain / self._average_loss
         return Decimal(100) - Decimal(100) / (Decimal(1) + relative_strength)
 
@@ -148,9 +291,9 @@ class MovingAverageConvergenceDivergence:
         self.reset()
 
     def reset(self) -> None:
-        self._fast = ExponentialMovingAverage(self.fast_period)
-        self._slow = ExponentialMovingAverage(self.slow_period)
-        self._signal = ExponentialMovingAverage(self.signal_period)
+        self._fast = PineExponentialMovingAverage(self.fast_period)
+        self._slow = PineExponentialMovingAverage(self.slow_period)
+        self._signal = PineExponentialMovingAverage(self.signal_period)
 
     def update(
         self, close: Decimal
@@ -205,7 +348,7 @@ class CommodityChannelIndex:
             (abs(value - average) for value in self._values), Decimal(0)
         ) / Decimal(self.period)
         if mean_deviation == 0:
-            return Decimal(0)
+            return None
         return (typical - average) / (Decimal("0.015") * mean_deviation)
 
 
@@ -240,7 +383,7 @@ class StochasticOscillator:
     def reset(self) -> None:
         self._highs: deque[Decimal] = deque()
         self._lows: deque[Decimal] = deque()
-        self._smooth = SimpleMovingAverage(self.smooth_period)
+        self._smooth = PineSimpleMovingAverage(self.smooth_period)
 
     def update(self, high: Decimal, low: Decimal, close: Decimal) -> Decimal | None:
         self._highs.append(Decimal(high))
@@ -253,7 +396,7 @@ class StochasticOscillator:
         highest = max(self._highs)
         lowest = min(self._lows)
         raw = (
-            Decimal(0)
+            None
             if highest == lowest
             else Decimal(100) * (Decimal(close) - lowest) / (highest - lowest)
         )
@@ -315,9 +458,8 @@ class ChaikinMoneyFlow:
         self.reset()
 
     def reset(self) -> None:
-        self._values: deque[tuple[Decimal, Decimal]] = deque()
-        self._flow_total = Decimal(0)
-        self._volume_total = Decimal(0)
+        self._flow_average = PineSimpleMovingAverage(self.period)
+        self._volume_average = PineSimpleMovingAverage(self.period)
 
     def update(
         self, high: Decimal, low: Decimal, close: Decimal, volume: Decimal
@@ -327,18 +469,62 @@ class ChaikinMoneyFlow:
         close = Decimal(close)
         volume = Decimal(volume)
         multiplier = (
-            Decimal(0)
+            None
             if high == low
             else ((close - low) - (high - close)) / (high - low)
         )
-        flow = multiplier * volume
-        self._values.append((flow, volume))
-        self._flow_total += flow
-        self._volume_total += volume
-        if len(self._values) > self.period:
-            old_flow, old_volume = self._values.popleft()
-            self._flow_total -= old_flow
-            self._volume_total -= old_volume
-        if len(self._values) < self.period or self._volume_total == 0:
+        flow = None if multiplier is None else multiplier * volume
+        flow_average = self._flow_average.update(flow)
+        volume_average = self._volume_average.update(volume)
+        if flow_average is None or volume_average in {None, Decimal(0)}:
             return None
-        return self._flow_total / self._volume_total
+        return flow_average / volume_average
+
+
+class MoneyFlowIndex:
+    """Pine v4 ``mfi(source, length)`` using positive/negative raw money flow."""
+
+    def __init__(self, period: int = 14) -> None:
+        if period < 1:
+            raise ValueError("MFI period must be positive")
+        self.period = period
+        self.reset()
+
+    def reset(self) -> None:
+        self._previous: Decimal | None = None
+        self._positive: deque[Decimal] = deque()
+        self._negative: deque[Decimal] = deque()
+        self._positive_total = Decimal(0)
+        self._negative_total = Decimal(0)
+
+    def update(self, source: Decimal, volume: Decimal) -> Decimal | None:
+        source = Decimal(source)
+        volume = Decimal(volume)
+        positive = Decimal(0)
+        negative = Decimal(0)
+        if self._previous is None:
+            # In Pine, change(source) is na on the first bar. An na ternary
+            # condition selects the false branch in both legacy mfi sums.
+            positive = source * volume
+            negative = source * volume
+        else:
+            if source > self._previous:
+                positive = source * volume
+            elif source < self._previous:
+                negative = source * volume
+        self._previous = source
+        self._positive.append(positive)
+        self._negative.append(negative)
+        self._positive_total += positive
+        self._negative_total += negative
+        if len(self._positive) > self.period:
+            self._positive_total -= self._positive.popleft()
+            self._negative_total -= self._negative.popleft()
+        if len(self._positive) < self.period:
+            return None
+        if self._negative_total == 0:
+            return Decimal(100) if self._positive_total > 0 else None
+        if self._positive_total == 0:
+            return Decimal(0)
+        ratio = self._positive_total / self._negative_total
+        return Decimal(100) - Decimal(100) / (Decimal(1) + ratio)

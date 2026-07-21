@@ -151,6 +151,45 @@ class DaemonReconciliationTests(unittest.TestCase):
         self.assertTrue(risk.locked)
         self.assertIn("UNPROTECTED_POSITION", alerts.events)
 
+    def test_stop_only_intent_does_not_warn_about_missing_take_profit(self):
+        self.journal.create_intent(
+            client_order_id="stop-only-entry",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity="0.001",
+            stop_price="49000",
+            take_profit_price=None,
+            details={},
+        )
+        client = ReconcileClient(
+            position_amount="0.001",
+            algo=[
+                {
+                    "symbol": "BTCUSDT",
+                    "clientAlgoId": "stop-only-protection",
+                    "algoId": 1,
+                    "side": "SELL",
+                    "orderType": "STOP_MARKET",
+                    "algoStatus": "NEW",
+                    "quantity": "0.001",
+                    "triggerPrice": "49000",
+                    "reduceOnly": True,
+                }
+            ],
+        )
+        alerts = AlertsStub()
+        result = AccountReconciler(
+            client,
+            self.journal,
+            ReconcileService(),
+            RiskStub(),
+            alerts,
+            ["BTCUSDT"],
+            "pause",
+        ).reconcile_symbol("BTCUSDT")
+        self.assertEqual(result["takeProfitOrders"], 0)
+        self.assertNotIn("MISSING_TAKE_PROFIT", alerts.events)
+
     def test_algo_update_transitions_algo_order_state(self):
         client = ReconcileClient(
             position_amount="0.001",

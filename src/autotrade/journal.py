@@ -784,7 +784,7 @@ class OrderJournal:
             row = self._connection.execute(
                 """
                 SELECT 1 FROM operator_commands
-                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE')
+                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE', 'STRATEGY_EXIT')
                   AND status IN ('PENDING', 'RUNNING')
                 LIMIT 1
                 """
@@ -804,14 +804,14 @@ class OrderJournal:
         command_type: str,
         payload: dict[str, Any],
     ) -> int | None:
-        if command_type not in {"ENTRY_INTENT", "STRATEGY_REVERSE"}:
+        if command_type not in {"ENTRY_INTENT", "STRATEGY_REVERSE", "STRATEGY_EXIT"}:
             raise ValueError("unsupported strategy command type")
         now = utc_now()
         with self._lock, self._connection:
             if self._connection.execute(
                 """
                 SELECT 1 FROM operator_commands
-                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE')
+                WHERE command_type IN ('ENTRY_INTENT', 'STRATEGY_REVERSE', 'STRATEGY_EXIT')
                   AND status IN ('PENDING', 'RUNNING')
                 LIMIT 1
                 """

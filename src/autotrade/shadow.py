@@ -8,15 +8,20 @@ from pathlib import Path
 from typing import Any
 
 from .candles import Candle
-from .strategy import Strategy, StrategyDecision, StrategySignal
+from .strategy import (
+    Strategy,
+    StrategyDecision,
+    StrategyExitDecision,
+    StrategySignal,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _PendingShadowAction:
     action: str
-    signal: StrategySignal
+    signal: StrategySignal | None
     current_position: str
-    decision: StrategyDecision | None = None
+    decision: StrategyDecision | StrategyExitDecision | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,44 +114,93 @@ class ShadowRunner:
         strategy.reset()
         for candle_index, candle in enumerate(candles):
             if pending is not None:
-                if pending.action == "REVERSE" and position is not None:
+                if pending.action == "EXIT":
+                    if position is not None:
+                        actual = "LONG" if position["side"] == "BUY" else "SHORT"
+                        if actual == pending.current_position:
+                            position = None
+                            cooldown_until_index = candle_index + self.cooldown_bars - 1
+                    pending = None
+                elif pending.action == "REVERSE" and position is not None:
                     actual = "LONG" if position["side"] == "BUY" else "SHORT"
                     if actual == pending.current_position:
                         position = None
-                entry_price = Decimal(candle.open)
-                signal = pending.signal
-                valid_gap = (
-                    signal.stop_price < entry_price < signal.take_profit_price
-                    if signal.side == "BUY"
-                    else signal.take_profit_price < entry_price < signal.stop_price
-                )
-                if valid_gap and position is None:
-                    position = {
-                        "side": signal.side,
-                        "entryTime": candle.open_time,
-                        "entryPrice": str(entry_price),
-                        "stopPrice": str(signal.stop_price),
-                        "takeProfitPrice": str(signal.take_profit_price),
-                        "signalId": self._signal_id(signal),
-                        "decisionId": (
-                            pending.decision.decision_id
-                            if pending.decision is not None
-                            else None
-                        ),
-                    }
-                pending = None
+                if pending is not None:
+                    assert pending.signal is not None
+                    entry_price = Decimal(candle.open)
+                    signal = pending.signal
+                    stop_valid = (
+                        signal.stop_price is None
+                        or signal.stop_price < entry_price
+                        if signal.side == "BUY"
+                        else signal.stop_price is None
+                        or entry_price < signal.stop_price
+                    )
+                    target_valid = (
+                        signal.take_profit_price is None
+                        or entry_price < signal.take_profit_price
+                        if signal.side == "BUY"
+                        else signal.take_profit_price is None
+                        or signal.take_profit_price < entry_price
+                    )
+                    valid_gap = stop_valid and target_valid
+                    minimum_stop_bps = Decimal(
+                        dict(signal.indicators).get("min_stop_bps", "0")
+                    )
+                    actual_stop_bps = (
+                        abs(entry_price - signal.stop_price)
+                        / entry_price
+                        * Decimal("10000")
+                        if signal.stop_price is not None
+                        else None
+                    )
+                    valid_gap = valid_gap and (
+                        actual_stop_bps is None
+                        or actual_stop_bps >= minimum_stop_bps
+                    )
+                    if valid_gap and position is None:
+                        position = {
+                            "side": signal.side,
+                            "entryTime": candle.open_time,
+                            "entryPrice": str(entry_price),
+                            "stopPrice": (
+                                str(signal.stop_price)
+                                if signal.stop_price is not None
+                                else None
+                            ),
+                            "takeProfitPrice": (
+                                str(signal.take_profit_price)
+                                if signal.take_profit_price is not None
+                                else None
+                            ),
+                            "signalId": self._signal_id(signal),
+                            "decisionId": (
+                                pending.decision.decision_id
+                                if pending.decision is not None
+                                else None
+                            ),
+                        }
+                    pending = None
 
             if position is not None:
                 high = Decimal(candle.high)
                 low = Decimal(candle.low)
-                stop = Decimal(str(position["stopPrice"]))
-                target = Decimal(str(position["takeProfitPrice"]))
+                stop = (
+                    Decimal(str(position["stopPrice"]))
+                    if position.get("stopPrice") is not None
+                    else None
+                )
+                target = (
+                    Decimal(str(position["takeProfitPrice"]))
+                    if position.get("takeProfitPrice") is not None
+                    else None
+                )
                 if position["side"] == "BUY":
-                    stop_hit = low <= stop
-                    target_hit = high >= target
+                    stop_hit = stop is not None and low <= stop
+                    target_hit = target is not None and high >= target
                 else:
-                    stop_hit = high >= stop
-                    target_hit = low <= target
+                    stop_hit = stop is not None and high >= stop
+                    target_hit = target is not None and low <= target
                 if stop_hit or target_hit:
                     position = None
                     cooldown_until_index = candle_index + self.cooldown_bars - 1
@@ -165,15 +219,34 @@ class ShadowRunner:
                 baseline is None or candle.open_time > baseline
             ):
                 strategy_decision = (
-                    output if isinstance(output, StrategyDecision) else None
+                    output
+                    if isinstance(output, (StrategyDecision, StrategyExitDecision))
+                    else None
+                )
+                exit_decision = (
+                    output if isinstance(output, StrategyExitDecision) else None
                 )
                 signal = (
                     strategy_decision.entry_signal
-                    if strategy_decision is not None
+                    if isinstance(strategy_decision, StrategyDecision)
                     else output
                 )
                 decision = "ACCEPTED"
-                if strategy_decision is not None and strategy_decision.action == "REVERSE":
+                if exit_decision is not None:
+                    actual = (
+                        "FLAT"
+                        if position is None
+                        else "LONG" if position["side"] == "BUY" else "SHORT"
+                    )
+                    if actual == exit_decision.current_position:
+                        decision = "EXIT_ACCEPTED"
+                        pending = _PendingShadowAction(
+                            "EXIT", None, exit_decision.current_position, exit_decision
+                        )
+                    else:
+                        decision = "EXIT_POSITION_MISMATCH"
+                elif strategy_decision is not None and strategy_decision.action == "REVERSE":
+                    assert isinstance(signal, StrategySignal)
                     actual = (
                         "FLAT"
                         if position is None
@@ -196,6 +269,7 @@ class ShadowRunner:
                 elif pending is not None:
                     decision = "PENDING_ENTRY"
                 else:
+                    assert isinstance(signal, StrategySignal)
                     pending = _PendingShadowAction(
                         "ENTER", signal, "FLAT", strategy_decision
                     )
@@ -209,16 +283,17 @@ class ShadowRunner:
                     and candle.open_time > cursor
                     and output_id not in logged
                 ):
-                    item = {
+                    item: dict[str, Any] = {
                         "event": (
                             "SHADOW_DECISION"
                             if strategy_decision is not None
                             else "SHADOW_SIGNAL"
                         ),
                         "decision": decision,
-                        "signalId": self._signal_id(signal),
-                        "signal": signal.as_dict(),
                     }
+                    if isinstance(signal, StrategySignal):
+                        item["signalId"] = self._signal_id(signal)
+                        item["signal"] = signal.as_dict()
                     if strategy_decision is not None:
                         item["decisionId"] = strategy_decision.decision_id
                         item["strategyDecision"] = strategy_decision.as_dict()
@@ -242,7 +317,9 @@ class ShadowRunner:
                     "last_open_time": last_open_time,
                     "started_after_open_time": baseline,
                     "pending_entry": (
-                        pending.signal.as_dict() if pending is not None else None
+                        pending.signal.as_dict()
+                        if pending is not None and pending.signal is not None
+                        else None
                     ),
                     "pending_action": (
                         {
@@ -276,10 +353,15 @@ class ShadowRunner:
                 1
                 for decision in emitted
                 if decision["decision"] in {"ACCEPTED", "REVERSE_ACCEPTED"}
+                or decision["decision"] == "EXIT_ACCEPTED"
             ),
             last_open_time=last_open_time,
             virtual_position=position,
-            pending_entry=(pending.signal.as_dict() if pending is not None else None),
+            pending_entry=(
+                pending.signal.as_dict()
+                if pending is not None and pending.signal is not None
+                else None
+            ),
             cooldown_bars_remaining=max(
                 0, cooldown_until_index - (len(candles) - 1) + 1
             ),
@@ -341,6 +423,11 @@ class ShadowRunner:
                 continue
             try:
                 payload = json.loads(line)
+                if payload.get("event") == "SHADOW_DECISION" and payload.get(
+                    "decision"
+                ) == "EXIT_ACCEPTED":
+                    values.add(str(payload["decisionId"]))
+                    continue
                 signal = StrategySignal.from_dict(payload["signal"])
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"invalid shadow log line {line_number}: {exc}") from exc
@@ -382,10 +469,12 @@ class ShadowRunner:
     @staticmethod
     def load_decision(
         log_path: Path, decision_id: str | None = None
-    ) -> StrategyDecision:
+    ) -> StrategyDecision | StrategyExitDecision:
         if not log_path.exists():
             raise ValueError(f"shadow log does not exist: {log_path}")
-        accepted: list[tuple[str, StrategyDecision]] = []
+        accepted: list[
+            tuple[str, StrategyDecision | StrategyExitDecision]
+        ] = []
         for line_number, line in enumerate(
             log_path.read_text(encoding="utf-8").splitlines(), start=1
         ):
@@ -395,12 +484,20 @@ class ShadowRunner:
                 payload = json.loads(line)
                 if payload.get("event") != "SHADOW_DECISION":
                     continue
-                if payload.get("decision") not in {"ACCEPTED", "REVERSE_ACCEPTED"}:
+                if payload.get("decision") not in {
+                    "ACCEPTED",
+                    "REVERSE_ACCEPTED",
+                    "EXIT_ACCEPTED",
+                }:
                     continue
                 raw = payload["strategyDecision"]
                 if not isinstance(raw, dict):
                     raise ValueError("strategy decision payload must be an object")
-                value = StrategyDecision.from_dict(raw)
+                value = (
+                    StrategyExitDecision.from_dict(raw)
+                    if raw.get("action") == "EXIT"
+                    else StrategyDecision.from_dict(raw)
+                )
                 candidate_id = str(payload["decisionId"])
                 if candidate_id != value.decision_id:
                     raise ValueError("shadow decision ID does not match decision content")

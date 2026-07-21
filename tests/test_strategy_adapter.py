@@ -12,6 +12,7 @@ from autotrade.journal import OrderJournal
 from autotrade.strategy.base import (
     DivergenceEvidence,
     StrategyDecision,
+    StrategyExitDecision,
     StrategySignal,
 )
 from autotrade.strategy_adapter import TestnetStrategyAdapter
@@ -253,6 +254,76 @@ class StrategyAdapterTests(unittest.TestCase):
         self.assertEqual(
             self.journal.strategy_reversal(decision.decision_id)["phase"], "QUEUED"
         )
+
+    def test_exit_decision_queues_risk_reducing_command_without_entry_intent(self):
+        instance = replace(
+            self.instance,
+            instance_id="divergence-test",
+            implementation="multi-divergence-reversal-v1",
+        )
+        self.journal.set_control("user_stream_healthy", "true", "test")
+        self.journal.set_control("market_data_BTCUSDT_5m_healthy", "true", "test")
+        self.journal.set_control("active_strategy_instance", "divergence-test", "test")
+        intent_id = self.journal.create_intent(
+            client_order_id="exit-active-entry",
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity="0.01",
+            stop_price="90",
+            take_profit_price=None,
+            details={},
+        )
+        self.journal.update(intent_id, "PROTECTED")
+        self.journal.record_order(
+            {
+                "symbol": "BTCUSDT",
+                "clientAlgoId": "exit-active-stop",
+                "algoId": "2",
+                "side": "SELL",
+                "orderType": "STOP_MARKET",
+                "algoStatus": "NEW",
+                "quantity": "0.01",
+                "reduceOnly": True,
+            },
+            family="ALGO",
+            role="STOP",
+            intent_id=intent_id,
+        )
+        decision = StrategyExitDecision(
+            strategy="multi-divergence-reversal-v1",
+            version="5",
+            instance_id="divergence-test",
+            symbol="BTCUSDT",
+            interval="5m",
+            candle_open_time=700_001,
+            candle_close_time=1_000_000,
+            current_position="LONG",
+            bullish_count=0,
+            bearish_count=0,
+            evidence=(),
+            reason="fixture exit",
+        )
+        adapter = TestnetStrategyAdapter(self.settings, self.journal, instance, "5")
+        preview = adapter.submit_decision(decision, execute=False, now_ms=1_001_000)
+        self.assertEqual(preview.action, "EXIT")
+        self.assertIsNone(preview.intent)
+        with patch("autotrade.strategy_adapter.lock_owner_active", return_value=True):
+            queued = adapter.submit_decision(decision, execute=True, now_ms=1_001_000)
+        command = self.journal.pending_commands()[0]
+        self.assertEqual(command["command_type"], "STRATEGY_EXIT")
+        self.assertEqual(queued.decision_id, decision.decision_id)
+
+    def test_research_only_strategy_is_rejected_before_preview(self):
+        self.healthy()
+        adapter = TestnetStrategyAdapter(
+            self.settings,
+            self.journal,
+            self.instance,
+            "1",
+            research_only=True,
+        )
+        with self.assertRaisesRegex(RuleViolation, "research-only"):
+            adapter.submit(signal(), execute=False, now_ms=1_001_000)
 
 
 if __name__ == "__main__":

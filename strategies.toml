@@ -52,8 +52,8 @@ interval = "5m"
 
 [instances.divergence-btc-5m.parameters]
 pivot_period = 5
-pivot_source = "high_low"
-max_pivots = 16
+pivot_source = "close"
+max_pivots = 10
 max_bars_to_check = 100
 divergence_types = ["regular", "hidden"]
 indicators = [
@@ -66,18 +66,95 @@ indicators = [
   "obv",
   "vwmacd",
   "cmf",
+  "mfi",
 ]
-min_entry_divergences = 2
+min_entry_divergences = 3
 min_reverse_divergences = 2
+min_entry_indicator_groups = 2
+min_entry_group_score = "0.65"
+min_exit_group_score = "0.65"
+oscillator_group_weight = "0.35"
+trend_group_weight = "0.35"
+volume_group_weight = "0.30"
+require_non_oscillator = true
+pine_show_limit = 1
 count_mode = "unique_indicators"
 conflict_policy = "hold"
 require_confirmation = true
+trend_filter_enabled = true
+trend_timeframe = "1h"
+trend_fast_ema = 50
+trend_slow_ema = 200
+structure_break_enabled = true
+breakout_lookback_bars = 3
+setup_expiry_bars = 6
+setup_invalidation_atr = "0.25"
 atr_period = 14
+adx_period = 14
+hidden_min_adx = "18"
+regular_max_adx = "30"
+volume_average_period = 20
+min_volume_ratio = "0.8"
+estimated_cost_bps_per_side = "15"
+expected_move_atr = "2"
+min_reward_cost_ratio = "1.5"
 stop_atr_buffer = "0.5"
-min_stop_atr = "0.5"
+min_stop_atr = "0.75"
 max_stop_atr = "3"
-safety_take_profit_rr = "3"
+min_stop_bps = "60"
 risk_usdt = "1"
 leverage = 3
 margin_utilization = "0.50"
+break_even_trigger_r = "1"
+trailing_start_r = "1.5"
+trailing_atr_multiple = "1"
+max_hold_bars = 24
+min_progress_r = "0.5"
+reentry_expiry_bars = 6
+market_filter_enabled = true
+position_management_enabled = true
+reverse_policy = "confirmed"
 allow_pyramiding = false
+consume_historical_pivot = true
+fixed_take_profit = false
+reverse_on_opposite_divergence = true
+
+[instances.hull-btc-1d]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "1d"
+
+[instances.hull-btc-1d.parameters]
+direction = "all"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-eth-1d]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "ETHUSDT"
+interval = "1d"
+
+[instances.hull-eth-1d.parameters]
+direction = "all"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"

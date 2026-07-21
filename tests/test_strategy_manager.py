@@ -177,7 +177,7 @@ unknown = 1
         with self.assertRaisesRegex(ValueError, "stop bps"):
             manager.build("lifecycle-pulse")
 
-    def test_project_divergence_instance_builds_confirmed_5m_strategy(self) -> None:
+    def test_project_divergence_instance_builds_pine_parity_5m_strategy(self) -> None:
         project_config = Path(__file__).resolve().parents[1] / "strategies.toml"
         manager = StrategyManager.from_toml(
             project_config, state_root=self.state_root
@@ -186,8 +186,14 @@ unknown = 1
         self.assertEqual(strategy.interval, "5m")
         self.assertEqual(strategy.pivot_period, 5)
         self.assertEqual(strategy.divergence_types, ("regular", "hidden"))
-        self.assertEqual(strategy.min_entry_divergences, 2)
+        self.assertEqual(strategy.min_entry_divergences, 3)
         self.assertEqual(strategy.min_reverse_divergences, 2)
+        self.assertEqual(strategy.min_entry_indicator_groups, 2)
+        self.assertEqual(strategy.pivot_source, "close")
+        self.assertTrue(strategy.require_confirmation)
+        self.assertTrue(strategy.trend_filter_enabled)
+        self.assertTrue(strategy.structure_break_enabled)
+        self.assertEqual(strategy.min_stop_bps, Decimal("60"))
 
 
 if __name__ == "__main__":

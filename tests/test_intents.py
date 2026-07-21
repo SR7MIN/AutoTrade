@@ -33,6 +33,8 @@ class EntryIntentTests(unittest.TestCase):
         intent = EntryIntent.create(
             source="test", symbol="BTCUSDT", side="SELL", risk_usdt=Decimal("2"),
             stop_price=Decimal("51000"), take_profit_price=None, leverage=2,
+            min_stop_bps=Decimal("60"),
+            max_stop_bps=Decimal("350"),
         )
         restored = EntryIntent.from_dict(intent.as_dict())
         self.assertEqual(restored, intent)

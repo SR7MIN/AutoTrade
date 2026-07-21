@@ -18,8 +18,8 @@ class StrategySignal:
     candle_close_time: int
     side: str
     reference_price: Decimal
-    stop_price: Decimal
-    take_profit_price: Decimal
+    stop_price: Decimal | None
+    take_profit_price: Decimal | None
     risk_usdt: Decimal
     leverage: int
     margin_utilization: Decimal
@@ -34,14 +34,22 @@ class StrategySignal:
             raise ValueError("strategy signal risk and leverage must be positive")
         if not Decimal("0") < self.margin_utilization <= Decimal("1"):
             raise ValueError("strategy signal margin utilization must be in (0, 1]")
-        if self.side == "BUY" and not (
-            self.stop_price < self.reference_price < self.take_profit_price
-        ):
-            raise ValueError("BUY signal prices are not ordered stop < reference < target")
-        if self.side == "SELL" and not (
-            self.take_profit_price < self.reference_price < self.stop_price
-        ):
-            raise ValueError("SELL signal prices are not ordered target < reference < stop")
+        if self.side == "BUY":
+            if self.stop_price is not None and self.stop_price >= self.reference_price:
+                raise ValueError("BUY signal stop must be below the reference price")
+            if (
+                self.take_profit_price is not None
+                and self.take_profit_price <= self.reference_price
+            ):
+                raise ValueError("BUY signal target must be above the reference price")
+        if self.side == "SELL":
+            if self.stop_price is not None and self.stop_price <= self.reference_price:
+                raise ValueError("SELL signal stop must be above the reference price")
+            if (
+                self.take_profit_price is not None
+                and self.take_profit_price >= self.reference_price
+            ):
+                raise ValueError("SELL signal target must be below the reference price")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -53,8 +61,12 @@ class StrategySignal:
             "candleCloseTime": self.candle_close_time,
             "side": self.side,
             "referencePrice": str(self.reference_price),
-            "stopPrice": str(self.stop_price),
-            "takeProfitPrice": str(self.take_profit_price),
+            "stopPrice": str(self.stop_price) if self.stop_price is not None else None,
+            "takeProfitPrice": (
+                str(self.take_profit_price)
+                if self.take_profit_price is not None
+                else None
+            ),
             "riskUsdt": str(self.risk_usdt),
             "leverage": self.leverage,
             "marginUtilization": str(self.margin_utilization),
@@ -91,8 +103,16 @@ class StrategySignal:
             candle_close_time=int(payload["candleCloseTime"]),
             side=str(payload["side"]).upper(),
             reference_price=Decimal(str(payload["referencePrice"])),
-            stop_price=Decimal(str(payload["stopPrice"])),
-            take_profit_price=Decimal(str(payload["takeProfitPrice"])),
+            stop_price=(
+                Decimal(str(payload["stopPrice"]))
+                if payload.get("stopPrice") is not None
+                else None
+            ),
+            take_profit_price=(
+                Decimal(str(payload["takeProfitPrice"]))
+                if payload.get("takeProfitPrice") is not None
+                else None
+            ),
             risk_usdt=Decimal(str(payload["riskUsdt"])),
             leverage=int(payload["leverage"]),
             margin_utilization=Decimal(str(payload["marginUtilization"])),
@@ -186,12 +206,20 @@ class StrategyDecision:
             raise ValueError("REVERSE decision requires an open current position")
         if self.action == "REVERSE" and self.current_position == self.target_position:
             raise ValueError("REVERSE target must oppose current position")
-        bullish = len(
-            {item.indicator for item in self.evidence if item.direction == "BULLISH"}
-        )
-        bearish = len(
-            {item.indicator for item in self.evidence if item.direction == "BEARISH"}
-        )
+        if self.version in {"1", "3", "4", "5"}:
+            # Preserve deserialization of decisions emitted by the old
+            # approximate detector.
+            bullish = len(
+                {item.indicator for item in self.evidence if item.direction == "BULLISH"}
+            )
+            bearish = len(
+                {item.indicator for item in self.evidence if item.direction == "BEARISH"}
+            )
+        else:
+            # TradingView counts each indicator/divergence-type slot. One
+            # indicator may contribute both regular and hidden slots.
+            bullish = sum(item.direction == "BULLISH" for item in self.evidence)
+            bearish = sum(item.direction == "BEARISH" for item in self.evidence)
         if bullish != self.bullish_count or bearish != self.bearish_count:
             raise ValueError("decision divergence counts do not match evidence")
 
@@ -274,7 +302,110 @@ class StrategyDecision:
         return result
 
 
-StrategyOutput: TypeAlias = StrategySignal | StrategyDecision
+@dataclass(frozen=True, slots=True)
+class StrategyExitDecision:
+    strategy: str
+    version: str
+    instance_id: str
+    symbol: str
+    interval: str
+    candle_open_time: int
+    candle_close_time: int
+    current_position: str
+    bullish_count: int
+    bearish_count: int
+    evidence: tuple[DivergenceEvidence, ...]
+    reason: str
+    action: str = "EXIT"
+    target_position: str = "FLAT"
+
+    def __post_init__(self) -> None:
+        if self.action != "EXIT" or self.target_position != "FLAT":
+            raise ValueError("exit decision must target FLAT")
+        if self.current_position not in {"LONG", "SHORT"}:
+            raise ValueError("exit decision requires an open current position")
+        bullish = len(
+            {item.indicator for item in self.evidence if item.direction == "BULLISH"}
+        )
+        bearish = len(
+            {item.indicator for item in self.evidence if item.direction == "BEARISH"}
+        )
+        if bullish != self.bullish_count or bearish != self.bearish_count:
+            raise ValueError("exit divergence counts do not match evidence")
+
+    @property
+    def decision_id(self) -> str:
+        evidence_identity = ",".join(
+            f"{item.indicator}:{item.divergence_type}:{item.direction}:"
+            f"{item.current_pivot_time}:{item.previous_pivot_time}"
+            for item in sorted(
+                self.evidence,
+                key=lambda item: (
+                    item.indicator,
+                    item.divergence_type,
+                    item.previous_pivot_time,
+                ),
+            )
+        )
+        identity = ":".join(
+            (
+                self.instance_id,
+                self.version,
+                self.symbol,
+                self.interval,
+                str(self.candle_close_time),
+                self.action,
+                self.current_position,
+                evidence_identity,
+                self.reason,
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "strategy": self.strategy,
+            "version": self.version,
+            "instanceId": self.instance_id,
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "candleOpenTime": self.candle_open_time,
+            "candleCloseTime": self.candle_close_time,
+            "action": self.action,
+            "currentPosition": self.current_position,
+            "targetPosition": self.target_position,
+            "bullishCount": self.bullish_count,
+            "bearishCount": self.bearish_count,
+            "evidence": [item.as_dict() for item in self.evidence],
+            "reason": self.reason,
+            "decisionId": self.decision_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "StrategyExitDecision":
+        evidence = value.get("evidence") or []
+        if not isinstance(evidence, list):
+            raise ValueError("exit decision evidence must be an array")
+        result = cls(
+            strategy=str(value["strategy"]),
+            version=str(value["version"]),
+            instance_id=str(value["instanceId"]),
+            symbol=str(value["symbol"]).upper(),
+            interval=str(value["interval"]),
+            candle_open_time=int(value["candleOpenTime"]),
+            candle_close_time=int(value["candleCloseTime"]),
+            current_position=str(value["currentPosition"]),
+            bullish_count=int(value["bullishCount"]),
+            bearish_count=int(value["bearishCount"]),
+            evidence=tuple(DivergenceEvidence.from_dict(item) for item in evidence),
+            reason=str(value["reason"]),
+        )
+        if value.get("decisionId") not in {None, result.decision_id}:
+            raise ValueError("exit decision ID does not match content")
+        return result
+
+
+StrategyOutput: TypeAlias = StrategySignal | StrategyDecision | StrategyExitDecision
 
 
 class Strategy(Protocol):

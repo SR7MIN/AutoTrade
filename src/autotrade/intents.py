@@ -23,6 +23,8 @@ class EntryIntent:
     margin_utilization: Decimal
     created_at_ms: int
     expires_at_ms: int
+    min_stop_bps: Decimal | None = None
+    max_stop_bps: Decimal | None = None
 
     @classmethod
     def create(
@@ -36,6 +38,8 @@ class EntryIntent:
         take_profit_price: Decimal | None,
         leverage: int,
         margin_utilization: Decimal = Decimal("0.50"),
+        min_stop_bps: Decimal | None = None,
+        max_stop_bps: Decimal | None = None,
         ttl_seconds: int = 30,
     ) -> "EntryIntent":
         now = int(time.time() * 1000)
@@ -55,6 +59,12 @@ class EntryIntent:
             margin_utilization=Decimal(margin_utilization),
             created_at_ms=now,
             expires_at_ms=now + ttl_seconds * 1000,
+            min_stop_bps=(
+                Decimal(min_stop_bps) if min_stop_bps is not None else None
+            ),
+            max_stop_bps=(
+                Decimal(max_stop_bps) if max_stop_bps is not None else None
+            ),
         )
 
     def validate_freshness(self, now_ms: int) -> None:
@@ -78,6 +88,12 @@ class EntryIntent:
             "margin_utilization": str(self.margin_utilization),
             "created_at_ms": self.created_at_ms,
             "expires_at_ms": self.expires_at_ms,
+            "min_stop_bps": (
+                str(self.min_stop_bps) if self.min_stop_bps is not None else None
+            ),
+            "max_stop_bps": (
+                str(self.max_stop_bps) if self.max_stop_bps is not None else None
+            ),
         }
 
     @classmethod
@@ -98,4 +114,14 @@ class EntryIntent:
             margin_utilization=Decimal(str(payload["margin_utilization"])),
             created_at_ms=int(payload["created_at_ms"]),
             expires_at_ms=int(payload["expires_at_ms"]),
+            min_stop_bps=(
+                Decimal(str(payload["min_stop_bps"]))
+                if payload.get("min_stop_bps") is not None
+                else None
+            ),
+            max_stop_bps=(
+                Decimal(str(payload["max_stop_bps"]))
+                if payload.get("max_stop_bps") is not None
+                else None
+            ),
         )

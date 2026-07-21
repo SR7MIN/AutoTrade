@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from autotrade.daemon import TradingDaemon
 from autotrade.intents import EntryIntent
 from autotrade.journal import OrderJournal
-from autotrade.strategy import DivergenceEvidence, StrategyDecision, StrategySignal
+from autotrade.strategy import (
+    DivergenceEvidence,
+    StrategyDecision,
+    StrategyExitDecision,
+    StrategySignal,
+)
 
 
 def decision() -> StrategyDecision:
@@ -153,6 +158,34 @@ class StrategyReversalExecutionTests(unittest.TestCase):
         pending = self.journal.pending_commands()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["command_type"], "STRATEGY_REVERSE")
+
+    def test_daemon_strategy_exit_only_closes_the_existing_side(self):
+        value = StrategyExitDecision(
+            strategy="multi-divergence-reversal-v1",
+            version="5",
+            instance_id="divergence-test",
+            symbol="BTCUSDT",
+            interval="5m",
+            candle_open_time=700_001,
+            candle_close_time=1_000_000,
+            current_position="LONG",
+            bullish_count=0,
+            bearish_count=0,
+            evidence=(),
+            reason="fixture exit",
+        )
+        payload = {
+            "symbol": "BTCUSDT",
+            "decisionId": value.decision_id,
+            "decision": value.as_dict(),
+        }
+        service = _FakeService(self.journal)
+        daemon = TradingDaemon(SimpleNamespace(), ["BTCUSDT"], "5m")
+        result = daemon._execute_command(
+            "STRATEGY_EXIT", payload, service, _FakeRisk()
+        )
+        self.assertEqual(service.events, ["close"])
+        self.assertEqual(result["decisionId"], value.decision_id)
 
 
 if __name__ == "__main__":

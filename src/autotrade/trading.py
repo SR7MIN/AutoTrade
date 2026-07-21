@@ -136,6 +136,8 @@ class TradingService:
         take_profit_price: Decimal | None,
         leverage: int,
         margin_utilization: Decimal = Decimal("0.50"),
+        min_stop_bps: Decimal | None = None,
+        max_stop_bps: Decimal | None = None,
     ) -> BracketResult:
         symbol = symbol.upper()
         side = side.upper()
@@ -167,6 +169,26 @@ class TradingService:
                 decimal_value(max_notional_value) if max_notional_value is not None else None
             ),
         )
+        if min_stop_bps is not None:
+            actual_stop_bps = (
+                abs(plan.entry_price - plan.stop_price)
+                / plan.entry_price
+                * Decimal("10000")
+            )
+            if actual_stop_bps < Decimal(min_stop_bps):
+                raise RuleViolation(
+                    "actual entry-to-stop distance is below the strategy minimum"
+                )
+        if max_stop_bps is not None:
+            actual_stop_bps = (
+                abs(plan.entry_price - plan.stop_price)
+                / plan.entry_price
+                * Decimal("10000")
+            )
+            if actual_stop_bps > Decimal(max_stop_bps):
+                raise RuleViolation(
+                    "actual entry-to-stop distance exceeds the strategy maximum"
+                )
         self.journal.record_account_snapshot(account)
         if self.risk_governor:
             mark = self.client.mark_price(symbol)
@@ -328,6 +350,8 @@ class TradingService:
             take_profit_price=intent.take_profit_price,
             leverage=intent.leverage,
             margin_utilization=intent.margin_utilization,
+            min_stop_bps=intent.min_stop_bps,
+            max_stop_bps=intent.max_stop_bps,
         )
 
     def _reconcile_unknown_entry(

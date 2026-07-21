@@ -1,0 +1,162 @@
+# Frozen research matrix for the Hull Suite direction/stop comparison.
+# All instances use HMA(55), daily closes, 1x notional, and full current equity.
+
+[instances.hull-btc-long-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "1d"
+
+[instances.hull-btc-long-stop.parameters]
+direction = "long"
+protective_stop_enabled = true
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-eth-long-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "ETHUSDT"
+interval = "1d"
+
+[instances.hull-eth-long-stop.parameters]
+direction = "long"
+protective_stop_enabled = true
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-btc-all-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "1d"
+
+[instances.hull-btc-all-stop.parameters]
+direction = "all"
+protective_stop_enabled = true
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-eth-all-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "ETHUSDT"
+interval = "1d"
+
+[instances.hull-eth-all-stop.parameters]
+direction = "all"
+protective_stop_enabled = true
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-btc-long-no-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "1d"
+
+[instances.hull-btc-long-no-stop.parameters]
+direction = "long"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-eth-long-no-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "ETHUSDT"
+interval = "1d"
+
+[instances.hull-eth-long-no-stop.parameters]
+direction = "long"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-btc-all-no-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "BTCUSDT"
+interval = "1d"
+
+[instances.hull-btc-all-no-stop.parameters]
+direction = "all"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
+
+[instances.hull-eth-all-no-stop]
+implementation = "hull-suite-full-equity-v1"
+enabled = true
+symbol = "ETHUSDT"
+interval = "1d"
+
+[instances.hull-eth-all-no-stop.parameters]
+direction = "all"
+protective_stop_enabled = false
+length = 55
+atr_period = 14
+stop_atr_multiple = "2"
+structure_lookback = 10
+structure_atr_buffer = "0.25"
+min_stop_atr = "1.5"
+max_stop_atr = "3.5"
+risk_usdt = "1"
+leverage = 1
+margin_utilization = "1"
